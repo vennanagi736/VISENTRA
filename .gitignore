@@ -1,0 +1,52 @@
+# ============================================================
+# VISENTRA - Git Ignore
+# ============================================================
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+environments/
+venv/
+.venv/
+env/
+
+# Model weights
+*.pth
+*.pt
+*.onnx
+*.engine
+
+# Generated results
+outputs/
+tmp/
+
+# Python build/cache
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Old/unused lane detection implementation
+CLRNet/
