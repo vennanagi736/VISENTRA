@@ -503,6 +503,95 @@ def select_two_lane_boundaries(lanes, image_shape):
     return selected
 
 
+def update_vehicle_tracks(detections, tracker):
+    """Update ByteTrack once and preserve original detection ordering."""
+    import supervision as sv
+
+    boxes = detections.get("boxes", []) or []
+    class_ids = detections.get("class_ids", []) or []
+    class_names = detections.get("class_names", []) or []
+    confidences = detections.get("confidences", []) or []
+
+    result = dict(detections)
+    result["track_ids"] = [None] * len(boxes)
+
+    # Track supported vehicle classes only.
+    source_indices = [
+        i for i, _ in enumerate(boxes)
+        if i < len(class_names) and is_vehicle_class(class_names[i])
+        and i < len(confidences)
+        and i < len(class_ids)
+        and len(boxes[i]) == 4
+    ]
+
+    xyxy = np.asarray(
+        [boxes[i] for i in source_indices], dtype=np.float32
+    ).reshape(-1, 4)
+
+    confidence = np.asarray(
+        [confidences[i] for i in source_indices], dtype=np.float32
+    )
+
+    classes = np.asarray(
+        [class_ids[i] for i in source_indices], dtype=np.int32
+    )
+
+    vehicle_detections = sv.Detections(
+        xyxy=xyxy,
+        confidence=confidence,
+        class_id=classes,
+        data={"source_index": np.asarray(source_indices, dtype=np.int32)},
+    )
+
+    tracked = tracker.update_with_detections(vehicle_detections)
+
+
+    if tracked.tracker_id is not None:
+        # Match tracked boxes back to the original detection indexes.
+        # Do not rely on custom fields surviving tracker.update_with_detections().
+        tracked_boxes = np.asarray(tracked.xyxy, dtype=np.float32).reshape(-1, 4)
+        tracked_ids = tracked.tracker_id
+        original_boxes = xyxy
+        used_source_indices = set()
+
+        for tracked_box, track_id in zip(tracked_boxes, tracked_ids):
+            if track_id is None:
+                continue
+
+            best_index = None
+            best_iou = 0.0
+
+            for local_index, original_box in enumerate(original_boxes):
+                source_index = source_indices[local_index]
+                if source_index in used_source_indices:
+                    continue
+
+                ax1, ay1, ax2, ay2 = tracked_box
+                bx1, by1, bx2, by2 = original_box
+
+                ix1 = max(ax1, bx1)
+                iy1 = max(ay1, by1)
+                ix2 = min(ax2, bx2)
+                iy2 = min(ay2, by2)
+
+                intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+                area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+                union = area_a + area_b - intersection
+                iou = intersection / union if union > 0 else 0.0
+
+                if iou > best_iou:
+                    best_iou = iou
+                    best_index = source_index
+
+            if best_index is not None and best_iou >= 0.20:
+                result["track_ids"][best_index] = int(track_id)
+                used_source_indices.add(best_index)
+
+    return result
+
+
+
 def draw_results(
     image_or_path,
     detections,
@@ -543,9 +632,19 @@ def draw_results(
         if x2 <= x1 or y2 <= y1:
             continue
 
+
         label = class_names[index] if index < len(class_names) else f"class {class_id}"
+
+        track_ids = detections.get("track_ids", [])
+        if index < len(track_ids) and track_ids[index] is not None:
+            label = f"ID {track_ids[index]} | {label}"
+
         distance_entry = distance_by_index.get(index)
-        if is_vehicle_class(label):
+        original_class_name = (
+            class_names[index] if index < len(class_names) else ""
+        )
+
+        if is_vehicle_class(original_class_name):
             if distance_entry and distance_entry.get("distance_m") is not None:
                 label += f" | ~{float(distance_entry['distance_m']):.1f} m"
             elif distances is not None:
@@ -1261,6 +1360,12 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
     for thread in threads:
         thread.start()
 
+    import supervision as sv
+
+    tracker = sv.ByteTrack()
+    last_tracked_frame_id = None
+    tracked_detections = None
+
     frame_number = 0
     display_fps = 0.0
     previous_display_time = time.perf_counter()
@@ -1300,8 +1405,17 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
 
             if rf_snapshot.get("frame") is not None:
                 display_frame = rf_snapshot["frame"].copy()
-                detections = rf_snapshot["result"]
+                raw_detections = rf_snapshot["result"]
                 rf_frame_id = rf_snapshot["frame_id"]
+
+                # Update only when RF-DETR publishes a new frame.
+                if rf_frame_id != last_tracked_frame_id:
+                    tracked_detections = update_vehicle_tracks(
+                        raw_detections, tracker
+                    )
+                    last_tracked_frame_id = rf_frame_id
+
+                detections = tracked_detections
                 if metric_snapshot.get("frame_id") == rf_frame_id:
                     distances = metric_snapshot["result"].get("distances", [])
                     depth_status = "Metric3D distance matched to this detection frame"
