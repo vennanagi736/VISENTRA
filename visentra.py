@@ -16,6 +16,7 @@ import time
 import socket
 import traceback
 from collections import deque
+from visentra_trajectory_predictor import VisentraTrajectoryPredictor
 from pathlib import Path
 
 import cv2
@@ -1664,41 +1665,30 @@ def update_vehicle_tracks(detections, tracker):
         tracked_boxes = np.asarray(tracked.xyxy, dtype=np.float32).reshape(-1, 4)
         tracked_ids = tracked.tracker_id
         original_boxes = xyxy
-        used_source_indices = set()
-
-        for tracked_box, track_id in zip(tracked_boxes, tracked_ids):
+        pairs = []
+        for t_idx, (tracked_box, track_id) in enumerate(zip(tracked_boxes, tracked_ids)):
             if track_id is None:
                 continue
-
-            best_index = None
-            best_iou = 0.0
-
+            ax1, ay1, ax2, ay2 = tracked_box
             for local_index, original_box in enumerate(original_boxes):
-                source_index = source_indices[local_index]
-                if source_index in used_source_indices:
-                    continue
-
-                ax1, ay1, ax2, ay2 = tracked_box
                 bx1, by1, bx2, by2 = original_box
-
-                ix1 = max(ax1, bx1)
-                iy1 = max(ay1, by1)
-                ix2 = min(ax2, bx2)
-                iy2 = min(ay2, by2)
-
-                intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-                area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-                area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-                union = area_a + area_b - intersection
+                intersection = (max(0.0, min(ax2, bx2) - max(ax1, bx1))
+                                * max(0.0, min(ay2, by2) - max(ay1, by1)))
+                union = (max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+                         + max(0.0, bx2 - bx1) * max(0.0, by2 - by1) - intersection)
                 iou = intersection / union if union > 0 else 0.0
-
-                if iou > best_iou:
-                    best_iou = iou
-                    best_index = source_index
-
-            if best_index is not None and best_iou >= 0.20:
-                result["track_ids"][best_index] = int(track_id)
-                used_source_indices.add(best_index)
+                if iou >= 0.20:
+                    pairs.append((iou, t_idx, local_index))
+        # Highest-IoU pairs first, each tracked box and each detection used once. The old
+        # per-track greedy loop could hand a detection to the wrong ID depending on array order.
+        used_tracked, used_source_indices = set(), set()
+        for iou, t_idx, local_index in sorted(pairs, key=lambda p: -p[0]):
+            source_index = source_indices[local_index]
+            if t_idx in used_tracked or source_index in used_source_indices:
+                continue
+            result["track_ids"][source_index] = int(tracked_ids[t_idx])
+            used_tracked.add(t_idx)
+            used_source_indices.add(source_index)
 
     return result
 
@@ -3002,6 +2992,67 @@ def assemble_live_distances(detections, frame_id, exact, cache, now):
 
 EMPTY_DETECTIONS = {"boxes": [], "class_ids": [], "class_names": [], "confidences": []}
 
+# Maximum |time difference| (seconds, capture time of the lane image vs. the detection image)
+# for a CurveLaneS result to be exported with a detection record. Replaces the old fixed
+# 45-frame limit. At ~1 lane result/second this admits at most the neighbouring results.
+LANE_ASSOC_MAX_AGE_S = 1.0
+
+
+def associate_lane(target_time, lane_times, max_age_s):
+    """Pick the lane result whose source image was captured closest in TIME to target_time.
+
+    lane_times: {lane_frame_id: capture_time_s}. Returns (lane_frame_id, dt_s, status):
+      status "ok"                -> lane_frame_id is usable (|dt| <= max_age_s)
+      status "no_lane_results"   -> no lane result exists at all
+      status "too_old_or_far"    -> nearest result is outside max_age_s (lane_frame_id/dt still
+                                    reported for the log, but the caller must NOT use it)
+    """
+    best_id, best_dt = None, None
+    for lane_id, lane_t in lane_times.items():
+        dt = lane_t - target_time
+        if best_dt is None or abs(dt) < abs(best_dt):
+            best_id, best_dt = lane_id, dt
+    if best_id is None:
+        return None, None, "no_lane_results"
+    if abs(best_dt) > max_age_s:
+        return best_id, best_dt, "too_old_or_far"
+    return best_id, best_dt, "ok"
+
+
+def summarize_gaps(timestamps):
+    """(count, median_gap_s, max_gap_s) of consecutive timestamp differences."""
+    gaps = sorted(b - a for a, b in zip(timestamps, timestamps[1:]))
+    if not gaps:
+        return len(timestamps), None, None
+    mid = len(gaps) // 2
+    median = gaps[mid] if len(gaps) % 2 else 0.5 * (gaps[mid - 1] + gaps[mid])
+    return len(timestamps), median, gaps[-1]
+
+
+def make_bytetrack(sv, buffer_frames=None, match_threshold=None, activation_threshold=None):
+    """Create sv.ByteTrack. Unset options keep the library defaults (unchanged behaviour).
+
+    Argument names differ between supervision releases, so only names the installed
+    constructor actually accepts are passed; unsupported requested options are reported.
+    """
+    import inspect
+    wanted = {
+        "lost_track_buffer": buffer_frames, "track_buffer": buffer_frames,
+        "minimum_matching_threshold": match_threshold, "match_thresh": match_threshold,
+        "track_activation_threshold": activation_threshold, "track_thresh": activation_threshold,
+    }
+    accepted = set(inspect.signature(sv.ByteTrack.__init__).parameters)
+    kwargs = {}
+    for name, value in wanted.items():
+        if value is not None and name in accepted:
+            kwargs[name] = value
+    for label, value in (("--bt-buffer", buffer_frames), ("--bt-match", match_threshold),
+                         ("--bt-activation", activation_threshold)):
+        if value is not None and not any(v == value for v in kwargs.values()):
+            log_warn(f"{label}={value} not supported by the installed supervision.ByteTrack; ignored.")
+    log_info(f"ByteTrack parameters passed: {kwargs or 'library defaults'}")
+    return sv.ByteTrack(**kwargs)
+
 PERF_CSV_FIELDS = [
     "elapsed_s", "capture_fps", "display_fps",
     "rf_fps", "rf_worker_ms", "rf_roundtrip_ms",
@@ -3017,7 +3068,9 @@ PERF_CSV_FIELDS = [
 def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH_SCALE,
                 with_lanes=False, serial=None, camera_fps=15, video_path=None,
                 threads=None, lane_every=1, metric_every=1, enable_deepsort=False,
-                detection_max_age=DETECTION_STALE_SECONDS, lane_max_age=LANE_STALE_SECONDS):
+                detection_max_age=DETECTION_STALE_SECONDS, lane_max_age=LANE_STALE_SECONDS,
+                emp_export_path=None, lane_assoc_max_age=LANE_ASSOC_MAX_AGE_S,
+                bt_buffer=None, bt_match=None, bt_activation=None):
     """Responsive live or recorded-video preview. One input, one worker per model, bounded queues.
 
     lane_every / metric_every: send every N-th completed RF-DETR frame to CurveLaneS / Metric3D
@@ -3062,7 +3115,12 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
         "track": {"frame_id": None, "detections": None, "completed_at": None, "error": None},
     }
     metric_history = {}    # frame_id -> (completed_at, distances)
+    lane_history = {}      # frame_id -> exact-frame lane polylines
     tracked_history = {}   # frame_id -> detections with ByteTrack/DeepSORT IDs
+    trajectory_predictor = VisentraTrajectoryPredictor()
+    trajectory_output_path = OUTPUT_DIR / f"trajectory_live_{SESSION_TAG}.jsonl"
+    trajectory_output_handle = trajectory_output_path.open("w", encoding="utf-8")
+    log_info(f"Trajectory predictions: {trajectory_output_path}")
     distance_cache = {}    # ByteTrack ID -> latest Metric3D value
     cached_frames = set()
     capture_ts = {}        # frame_id -> perf_counter() when that frame was captured
@@ -3076,12 +3134,28 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
     deepsort_tracker = None
     csv_handle = None
     csv_writer = None
+    emp_export_handle = None
+    emp_exported_frames = set()
+    export_pending = {}      # frame_id -> record awaiting lane association (not trimmed to 16)
+    lane_capture_ts = {}     # lane frame_id -> capture time of the image CurveLaneS processed
+    obs_by_track = {}        # ByteTrack ID -> [capture timestamps of observations]
+    tracker_input_ts = []    # capture timestamps of every frame that entered ByteTrack
+    lane_assoc_log = []      # (target_fid, lane_fid, dt_s, n_lanes, status)
+    media_time = {}          # frame_id -> position in the source video (s); recorded video only
     warmup_size = f"{width}x{height}"
     source_fps = None
     window_name = (
         f"VISENTRA - {Path(video_path).name}" if video_path is not None
         else "VISENTRA - Live Rear Camera"
     )
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 960, 540)
+
+    if emp_export_path is not None:
+        export_path = Path(emp_export_path).expanduser().resolve()
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        emp_export_handle = export_path.open("w", encoding="utf-8")
+        log_info(f"EMP experimental export: {export_path}")
 
     def update_rate(name, completed):
         state[name]["completed_at"] = completed
@@ -3126,6 +3200,14 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                     state[name]["error"] = None
                     if name == "lane":
                         state["lane"]["lanes"] = result.get("lanes", [])
+                        lane_history[frame_id] = result.get("lanes", [])
+                        if capture_ts.get(frame_id) is not None:
+                            lane_capture_ts[frame_id] = capture_ts[frame_id]
+                        cutoff = frame_id - CAPTURE_TS_KEEP_FRAMES
+                        for old_id in list(lane_history):
+                            if old_id < cutoff:
+                                lane_history.pop(old_id, None)
+                                lane_capture_ts.pop(old_id, None)
                     elif name == "metric":
                         metric_history[frame_id] = (t_done, result.get("distances", []))
                         _trim_history(metric_history)
@@ -3169,6 +3251,7 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                     pass
 
     def track_loop():
+        last_tracked_frame_id = -1
         while not stop_event.is_set():
             try:
                 item = queues["track"].get(timeout=0.1)
@@ -3178,8 +3261,54 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                 break
             frame, frame_id, detections = item
             try:
+                frame_id = int(frame_id)
+                if frame_id <= last_tracked_frame_id:
+                    log_warn_once(
+                        f"out_of_order_track_frame:{frame_id}",
+                        f"Skipping out-of-order tracking frame {frame_id}; "
+                        f"latest processed frame is {last_tracked_frame_id}."
+                    )
+                    continue
+                last_tracked_frame_id = frame_id
+
                 t0 = time.perf_counter()
                 tracked = update_vehicle_tracks(detections, bytetrack)       # ByteTrack
+                # Forecast only when a new ByteTrack result arrives.
+                # Use the source frame's capture timestamp, not worker completion time.
+                observation_ts = capture_ts.get(frame_id)
+                if observation_ts is None:
+                    observation_ts = time.perf_counter()
+                trajectory_record = {
+                    "frame_id": int(frame_id),
+                    "timestamp_s": float(observation_ts),
+                    "detections": tracked,
+                }
+                trajectory_result = trajectory_predictor.update_record(
+                    trajectory_record
+                )
+                tracked["trajectory_predictions"] = trajectory_result["predictions"]
+                # Observation timing measured where detections ENTER ByteTrack.
+                tracker_input_ts.append(float(observation_ts))
+                for tid in tracked.get("track_ids", []) or []:
+                    if tid is not None:
+                        obs_by_track.setdefault(int(tid), []).append(float(observation_ts))
+                # Save actual tracked detections and forecasts together
+                # so future evaluation can compare forecasts with observations.
+                trajectory_log_record = {
+                    "frame_id": int(frame_id),
+                    "timestamp_s": float(observation_ts),
+                    "detections": {
+                        "boxes": tracked.get("boxes", []),
+                        "track_ids": tracked.get("track_ids", []),
+                        "class_names": tracked.get("class_names", []),
+                        "confidences": tracked.get("confidences", []),
+                    },
+                    "predictions": trajectory_result.get("predictions", []),
+                }
+                trajectory_output_handle.write(
+                    json.dumps(trajectory_log_record) + "\n"
+                )
+                trajectory_output_handle.flush()
                 t1 = time.perf_counter()
                 perf.add("bytetrack", (t1 - t0) * 1000.0)
                 if deepsort_tracker is not None:                             # optional DeepSORT
@@ -3192,6 +3321,19 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                     )
                     tracked_history[frame_id] = tracked
                     _trim_history(tracked_history)
+                    if emp_export_handle is not None and capture_ts.get(frame_id) is not None:
+                        export_pending[frame_id] = {
+                            "frame_id": int(frame_id),
+                            "timestamp_s": float(capture_ts[frame_id]),
+                            "media_time_s": media_time.get(frame_id),
+                            "detections": {
+                                "boxes": [[float(v) for v in b] for b in (tracked.get("boxes") or [])],
+                                "class_names": [str(v) for v in (tracked.get("class_names") or [])],
+                                "track_ids": [None if v is None else int(v)
+                                              for v in (tracked.get("track_ids") or [])],
+                                "confidences": [float(v) for v in (tracked.get("confidences") or [])],
+                            },
+                        }
             except Exception as exc:  # noqa: BLE001
                 with state_lock:
                     state["track"]["error"] = str(exc)
@@ -3335,7 +3477,7 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
         import supervision as sv
 
         # ByteTrack is always enabled.
-        bytetrack = sv.ByteTrack()
+        bytetrack = make_bytetrack(sv, bt_buffer, bt_match, bt_activation)
         if enable_deepsort:
             from deep_sort_realtime.deepsort_tracker import DeepSort
             # Optional independent DeepSORT tracker for comparison (costly: CNN embedder on CPU).
@@ -3406,6 +3548,11 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
 
             capture_time = time.perf_counter()
             capture_ts[frame_number] = capture_time
+            if video_path is not None and source_fps:
+                media_time[frame_number] = (frame_number - 1) / source_fps
+                if frame_number % 300 == 0:
+                    for old_id in [k for k in media_time if k < frame_number - CAPTURE_TS_KEEP_FRAMES]:
+                        media_time.pop(old_id, None)
             perf.tick("capture", capture_time)
             perf.count("captured")
             if frame_number % 300 == 0:
@@ -3435,6 +3582,52 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                 exact = metric_history.get(tracked_fid)
                 exact_distances = exact[1] if exact is not None else None
                 lanes_now = list(lane_state["lanes"])
+                export_records = []
+                if emp_export_handle is not None:
+                    # A record is released only when the lane association is final: a lane result
+                    # captured at/after the detection frame exists (so the nearest-in-time choice
+                    # is known) or the detection is older than the maximum association age.
+                    newest_lane_t = max(lane_capture_ts.values(), default=None)
+                    for fid in sorted(export_pending):
+                        det_t = capture_ts.get(fid)
+                        if det_t is None:
+                            export_pending.pop(fid, None)
+                            continue
+                        waited = now - det_t
+                        ready = (not with_lanes
+                                 or (newest_lane_t is not None and newest_lane_t >= det_t)
+                                 or waited > lane_assoc_max_age)
+                        if not ready:
+                            continue
+                        record = export_pending.pop(fid)
+                        lane_fid, lane_dt, lane_status = associate_lane(
+                            det_t, lane_capture_ts, lane_assoc_max_age)
+                        safe_lanes = []
+                        if lane_status == "ok":
+                            safe_lanes = [
+                                [[float(pt[0]), float(pt[1])] for pt in lane]
+                                for lane in lane_history.get(lane_fid, [])
+                                if lane is not None and len(lane) >= 2
+                            ]
+                        record["lanes"] = safe_lanes
+                        record["lane_association"] = {
+                            "status": lane_status,
+                            "target_frame_id": int(fid),
+                            "lane_source_frame_id": None if lane_fid is None else int(lane_fid),
+                            "dt_s": None if lane_dt is None else float(lane_dt),
+                            "max_age_s": float(lane_assoc_max_age),
+                            "lane_count": len(safe_lanes),
+                        }
+                        lane_assoc_log.append(
+                            (fid, lane_fid, lane_dt, len(safe_lanes), lane_status))
+                        export_records.append(record)
+
+            if emp_export_handle is not None:
+                for record in export_records:
+                    emp_export_handle.write(json.dumps(record) + "\n")
+                    emp_exported_frames.add(record["frame_id"])
+                if export_records:
+                    emp_export_handle.flush()
 
             status_lines = []
             detections_for_draw = EMPTY_DETECTIONS
@@ -3608,6 +3801,73 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                 csv_handle.close()
             except OSError:
                 pass
+        try:
+            trajectory_output_handle.close()
+        except (OSError, NameError):
+            pass
+        if emp_export_handle is not None:
+            # Records still waiting for a lane at session end: associate with what exists now.
+            try:
+                for fid in sorted(export_pending):
+                    record = export_pending[fid]
+                    det_t = record["timestamp_s"]
+                    lane_fid, lane_dt, lane_status = associate_lane(
+                        det_t, lane_capture_ts, lane_assoc_max_age)
+                    lanes_out = []
+                    if lane_status == "ok":
+                        lanes_out = [
+                            [[float(pt[0]), float(pt[1])] for pt in lane]
+                            for lane in lane_history.get(lane_fid, [])
+                            if lane is not None and len(lane) >= 2
+                        ]
+                    record["lanes"] = lanes_out
+                    record["lane_association"] = {
+                        "status": lane_status, "target_frame_id": int(fid),
+                        "lane_source_frame_id": None if lane_fid is None else int(lane_fid),
+                        "dt_s": None if lane_dt is None else float(lane_dt),
+                        "max_age_s": float(lane_assoc_max_age), "lane_count": len(lanes_out),
+                    }
+                    lane_assoc_log.append((fid, lane_fid, lane_dt, len(lanes_out), lane_status))
+                    emp_export_handle.write(json.dumps(record) + "\n")
+                export_pending.clear()
+            except Exception as exc:  # noqa: BLE001
+                log_warn(f"could not flush pending EMP export records: {exc}")
+            try:
+                emp_export_handle.close()
+            except OSError:
+                pass
+
+        # ---- diagnostics requested for tracking continuity and lane association ----
+        try:
+            n_in, med_in, max_in = summarize_gaps(tracker_input_ts)
+            log_info(f"Tracker input: {n_in} frames entered ByteTrack; gap between them: median "
+                     f"{_fmt(med_in, '.2f', ' s')}, max {_fmt(max_in, '.2f', ' s')} "
+                     "(EMP allows at most 0.5 s between history steps).")
+            if obs_by_track:
+                lengths = sorted(len(v) for v in obs_by_track.values())
+                log_info(f"ByteTrack IDs: {len(obs_by_track)}; history length distribution "
+                         f"(observations per ID): {lengths}")
+                for tid, stamps in sorted(obs_by_track.items(), key=lambda kv: -len(kv[1]))[:12]:
+                    n, med, mx = summarize_gaps(stamps)
+                    log_info(f"  track {tid}: {n} observations, median gap {_fmt(med, '.2f', ' s')}, "
+                             f"max gap {_fmt(mx, '.2f', ' s')}")
+            if lane_assoc_log:
+                counts = {}
+                for _, _, _, _, status in lane_assoc_log:
+                    counts[status] = counts.get(status, 0) + 1
+                dts = [abs(dt) for _, _, dt, _, st in lane_assoc_log if dt is not None and st == "ok"]
+                log_info(f"Lane association (max age {lane_assoc_max_age:.2f} s): {counts}; "
+                         f"|dt| of accepted associations: "
+                         f"{_fmt(min(dts) if dts else None, '.2f', ' s')} min, "
+                         f"{_fmt(sum(dts) / len(dts) if dts else None, '.2f', ' s')} mean, "
+                         f"{_fmt(max(dts) if dts else None, '.2f', ' s')} max")
+                for target, lane_id, dt, n_lanes, status in lane_assoc_log[:5] + lane_assoc_log[-3:]:
+                    parent_log(f"lane association: target frame {target} <- lane frame {lane_id}, "
+                               f"dt {dt}, lanes {n_lanes}, {status}")
+                parent_log("full lane association log: "
+                           + json.dumps([list(x) for x in lane_assoc_log]))
+        except Exception as exc:  # noqa: BLE001
+            log_warn(f"could not print tracking/lane diagnostics: {exc}")
 
         # Final, unambiguous account of what happened and in what order.
         log_info(f"Shutdown reason (first recorded): {SHUTDOWN.reason}")
@@ -3650,6 +3910,8 @@ def main():
                         help="Provisional raw Metric3D depth multiplier; default 0.373572")
     parser.add_argument("--live", action="store_true",
                         help="Run live inference on the Vivo rear camera (started automatically)")
+    parser.add_argument("--emp-export", default=None,
+                        help="Write experimental tracked-vehicle/lane JSONL for EMP testing")
     parser.add_argument("--video-dir", default=None,
                         help="Play every supported recorded video in this folder through the existing "
                              "VISENTRA pipeline at the original frame rate")
@@ -3688,7 +3950,20 @@ def main():
                         help="Do not draw RF-DETR results captured more than this many seconds ago (default 5)")
     parser.add_argument("--lane-max-age", type=float, default=LANE_STALE_SECONDS,
                         help="Do not draw lane results captured more than this many seconds ago (default 8)")
+    parser.add_argument("--lane-assoc-max-age", type=float, default=LANE_ASSOC_MAX_AGE_S,
+                        help="Max |time difference| in seconds between a detection frame and the "
+                             "lane image exported with it (default 1.0)")
+    parser.add_argument("--bt-buffer", type=int, default=None,
+                        help="ByteTrack lost-track buffer (default: library default). Measure ID "
+                             "switches before changing it.")
+    parser.add_argument("--bt-match", type=float, default=None,
+                        help="ByteTrack minimum matching threshold (default: library default)")
+    parser.add_argument("--bt-activation", type=float, default=None,
+                        help="ByteTrack activation threshold (default: library default)")
     args = parser.parse_args()
+
+    if args.lane_assoc_max_age <= 0:
+        parser.error("--lane-assoc-max-age must be positive")
 
     if not np.isfinite(args.depth_scale) or args.depth_scale <= 0:
         parser.error("--depth-scale must be a positive finite number")
@@ -3721,6 +3996,9 @@ def main():
         thread_config = parse_threads_option(args.threads) if args.threads else dict(DEFAULT_THREADS)
     except ValueError as exc:
         parser.error(f"--threads: {exc}")
+    if args.emp_export and not args.with_lanes:
+        parser.error("--emp-export requires --with-lanes")
+
     if args.lane_every < 1 or args.metric_every < 1:
         parser.error("--lane-every and --metric-every must be 1 or larger")
     if args.detection_max_age <= 0 or args.lane_max_age <= 0:
@@ -3746,6 +4024,11 @@ def main():
         enable_deepsort=args.with_deepsort,
         detection_max_age=args.detection_max_age,
         lane_max_age=args.lane_max_age,
+        emp_export_path=args.emp_export,
+        lane_assoc_max_age=args.lane_assoc_max_age,
+        bt_buffer=args.bt_buffer,
+        bt_match=args.bt_match,
+        bt_activation=args.bt_activation,
     )
 
     if args.video_dir is not None:
@@ -3767,7 +4050,62 @@ def main():
         for index, video_path in enumerate(videos, start=1):
             print(f"\n========== VIDEO {index}/{len(videos)}: {video_path.name} ==========", flush=True)
             try:
-                master_live(video_path=video_path, **live_options)
+                video_options = dict(live_options)
+                if args.emp_export:
+                    base_export = Path(args.emp_export).expanduser()
+                    suffix = base_export.suffix or ".jsonl"
+                    video_options["emp_export_path"] = str(
+                        base_export.with_name(
+                            f"{base_export.stem}_{video_path.stem}{suffix}"
+                        )
+                    )
+                master_live(video_path=video_path, **video_options)
+
+                # Run EMP-M and EMP-D after the video export is closed.
+                if args.emp_export:
+                    emp_root = Path("research_models/EMP").resolve()
+                    emp_python = emp_root / ".venv" / "Scripts" / "python.exe"
+                    emp_adapter = emp_root / "visentra_emp_adapter.py"
+                    export_file = Path(video_options["emp_export_path"]).expanduser().resolve()
+                    prediction_file = export_file.with_name(
+                        export_file.stem + "_predictions.jsonl"
+                    )
+
+                    if not export_file.is_file():
+                        log_error(
+                            f"EMP skipped for {video_path.name}: export file not found: "
+                            f"{export_file}"
+                        )
+                    elif not emp_python.is_file() or not emp_adapter.is_file():
+                        log_error(
+                            "EMP skipped: adapter or EMP virtual-environment Python "
+                            f"not found under {emp_root}"
+                        )
+                    else:
+                        log_info(f"Running EMP-M and EMP-D for {video_path.name}")
+                        try:
+                            result = subprocess.run(
+                                [
+                                    str(emp_python),
+                                    str(emp_adapter),
+                                    "--input", str(export_file),
+                                    "--output", str(prediction_file),
+                                ],
+                                cwd=str(emp_root),
+                                check=False,
+                            )
+                            if result.returncode == 0:
+                                log_info(
+                                    f"EMP adapter finished for {video_path.name}; "
+                                    f"predictions: {prediction_file}"
+                                )
+                            else:
+                                log_error(
+                                    f"EMP adapter exited with code {result.returncode} "
+                                    f"for {video_path.name}; continuing to the next video."
+                                )
+                        except OSError as exc:
+                            log_error(f"Could not launch EMP adapter: {exc}")
             except (RuntimeError, FileNotFoundError, TimeoutError) as exc:
                 log_error(f"Could not process {video_path.name}: {exc}")
                 continue
