@@ -50,3 +50,9 @@ Thumbs.db
 
 # Old/unused lane detection implementation
 CLRNet/
+# HiVT research artifacts
+*.ckpt
+events.out.tfevents.*
+research_models/HiVT/.venv/
+research_models/HiVT/checkpoints/
+research_models/HiVT/datasets/

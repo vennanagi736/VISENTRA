@@ -43,6 +43,18 @@ METRIC_MODEL = ROOT / r"metric3d_test\models\metric3d_v2_vit_small.onnx"
 METRIC_CONFIG = ROOT / r"metric3d_test\models\preprocessor_config.json"
 METRIC_RESULTS_DIR = ROOT / r"metric3d_test\results"
 
+# HiVT trajectory forecasting (experimental; optional, enabled with --with-hivt).
+# Runs in its own process with its own environment, like the other models.
+HIVT_ROOT = ROOT / "research_models" / "HiVT"
+HIVT_PYTHON = HIVT_ROOT / ".venv" / "Scripts" / "python.exe"
+HIVT_WORKER_SCRIPT = ROOT / "Claude" / "visentra_hivt_worker.py"
+HIVT_ADAPTER_SCRIPT = ROOT / "Claude" / "visentra_hivt_adapter.py"
+HIVT_CHECKPOINT_NAME = "epoch=63-step=411903.ckpt"
+HIVT_REQUEST_TIMEOUT_S = 20.0
+# BGR colours for the prediction modes, most probable first.
+HIVT_MODE_COLORS = [(255, 0, 255), (0, 215, 255), (255, 200, 0), (120, 255, 120),
+                    (255, 120, 120), (200, 200, 200)]
+
 OUTPUT_DIR = ROOT / "outputs"
 TMP_DIR = ROOT / "tmp"
 # Per-session diagnostic logs: one file per worker plus one for the parent process.
@@ -101,7 +113,7 @@ def draw_reverse_grid(frame):
         cv2.line(frame, (top_x, top_y),
                  (bottom_x, bottom_y), (0, 200, 255), 1)
 
-    # Ten visual bands across the nominal 0–100 m range
+    # Ten visual bands across the nominal 0â€“100 m range
     for i in range(1, 10):
         fraction = i / 10
         y = int(bottom_y - fraction * (bottom_y - top_y))
@@ -430,7 +442,7 @@ class ResourceMonitor:
 # ============================================================
 # AUTOMATIC VIVO V27 REAR CAMERA STARTUP (scrcpy raw H.264)
 # ============================================================
-SCRCPY_SERVER_VERSION_FALLBACK = "5.0.1"
+SCRCPY_SERVER_VERSION_FALLBACK = "4.1"
 # Session-specific file name so we never overwrite a jar used by a separate scrcpy run.
 VIVO_REMOTE_SERVER_PATH = "/data/local/tmp/visentra-scrcpy-server.jar"
 VIVO_CONNECT_TIMEOUT_S = 25.0       # server start + socket + first encoded bytes
@@ -3053,6 +3065,372 @@ def make_bytetrack(sv, buffer_frames=None, match_threshold=None, activation_thre
     log_info(f"ByteTrack parameters passed: {kwargs or 'library defaults'}")
     return sv.ByteTrack(**kwargs)
 
+# ============================================================
+# HiVT TRAJECTORY FORECASTING (EXPERIMENTAL, image-plane) - optional, enabled with --with-hivt
+# ============================================================
+# Pipeline: RF-DETR -> ByteTrack -> per-ID observation history -> HiVT worker (own process/env)
+#           -> predicted paths drawn on the annotated frame.
+# The forecasts are in an experimental IMAGE-PLANE representation (see visentra_hivt_adapter.py).
+# They are not metric, not calibrated, and must not be used for distance, speed or safety claims.
+def hivt_checkpoint(variant):
+    return HIVT_ROOT / "checkpoints" / f"HiVT-{variant}" / "checkpoints" / HIVT_CHECKPOINT_NAME
+
+
+def check_hivt_paths(variant):
+    paths = {
+        "HiVT Python (dedicated environment)": HIVT_PYTHON,
+        "HiVT worker script": HIVT_WORKER_SCRIPT,
+        "HiVT adapter": HIVT_ADAPTER_SCRIPT,
+        "HiVT source (models/hivt.py)": HIVT_ROOT / "models" / "hivt.py",
+        f"HiVT-{variant} checkpoint": hivt_checkpoint(variant),
+    }
+    print("\n========== HiVT PATH CHECK (--with-hivt) ==========")
+    for name, path in paths.items():
+        if not path.exists():
+            raise FileNotFoundError(f"Missing {name}: {path}  (required by --with-hivt)")
+        print(f"[OK] {name}: {path}")
+    print("===================================================\n")
+
+
+def align_hivt_path(pred, drawn_box, display_ts, max_modes=3):
+    """Time-align a HiVT forecast with the frame that is being DISPLAYED.
+
+    A forecast is computed for time t_obs (the capture time of the detection frame it started from);
+    point j of its path is the predicted position at t_obs + j*dt (point 0 is the last observed anchor).
+    The displayed frame was captured at display_ts >= t_obs, so the first n = (display_ts - t_obs)/dt
+    steps are already in the past. The returned path therefore has
+      * "past":   the already-elapsed part (anchor -> predicted position now), to be drawn faintly, and
+      * "future": the part still ahead, starting at the vehicle's PREDICTED position in the displayed
+                  frame, which is what gets drawn boldly.
+    Nothing is invented: both parts are the model's own output, only re-indexed in time. Returns
+    (status, path) where status is "ok" or the reason nothing may be drawn.
+    """
+    try:
+        x1, y1, x2, y2 = [float(v) for v in drawn_box[:4]]
+    except (TypeError, ValueError):
+        return "bad_box", None
+    if not all(math.isfinite(v) for v in (x1, y1, x2, y2)) or x2 <= x1 or y2 <= y1:
+        return "bad_box", None
+    modes = pred.get("modes") or []
+    if not modes:
+        return "no_modes", None
+    steps = len(modes[0]["points"])
+    dt = float(pred.get("dt_s", 0.1))
+    elapsed = float(display_ts) - float(pred["t_obs"])
+    if elapsed < -1e-6:
+        return "prediction_newer_than_displayed_frame", None
+    n_now = int(math.floor(elapsed / dt + 1e-6))          # index (in anchor+path) of "the displayed frame"
+    if n_now >= steps - 1:
+        return "expired", None
+    anchor_obs = np.asarray(pred["anchor_px"], dtype=np.float64)
+    out = []
+    for rank, mode in enumerate(modes[:max_modes]):
+        pts = np.asarray(mode["points"], dtype=np.float64)
+        if pts.shape != (steps, 2) or not np.all(np.isfinite(pts)):
+            continue
+        full = np.vstack([anchor_obs, pts])               # index j = predicted position at t_obs + j*dt
+        out.append({"rank": rank, "mode": int(mode["mode"]), "probability": float(mode["probability"]),
+                    "past": full[:n_now + 1], "points": full[n_now:]})
+    if not out:
+        return "no_valid_modes", None
+    return "ok", {"track_id": int(pred["track_id"]), "modes": out, "dt_s": dt,
+                  "horizon_s": (steps - n_now) * dt, "elapsed_s": elapsed,
+                  "real_obs_used": pred.get("real_obs_used"),
+                  "interpolated_fraction": pred.get("interpolated_fraction")}
+
+
+def _hivt_px(point, w, h):
+    """Finite, bounded integer pixel position (never raises inside cv2)."""
+    x, y = float(point[0]), float(point[1])
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    return int(round(max(-1e5, min(1e5, x)))), int(round(max(-1e5, min(1e5, y))))
+
+
+def draw_hivt_paths(image, paths):
+    """Draw forecasts onto an annotated BGR frame (in place). Everything is clipped to the image.
+
+    Bold line = predicted future from the vehicle's predicted position in THIS frame (dot every second,
+    arrow at the end). Thin dim line = the part of the forecast that has already elapsed since the
+    detection the forecast started from (links the stale box to the predicted current position).
+    """
+    h, w = image.shape[:2]
+
+    def segments(points, color, thickness):
+        pts = [_hivt_px(p, w, h) for p in points]
+        for a, b in zip(pts[:-1], pts[1:]):
+            if a is None or b is None:
+                continue
+            ok, p1, p2 = cv2.clipLine((0, 0, w, h), a, b)       # clip each segment to the frame
+            if ok:
+                cv2.line(image, p1, p2, color, thickness, cv2.LINE_AA)
+        return pts
+
+    for item in paths or []:
+        steps_per_second = max(1, int(round(1.0 / item["dt_s"])))
+        best = item["modes"][0]
+        if len(best["past"]) > 1:
+            segments(best["past"], (170, 170, 170), 1)
+        for mode in reversed(item["modes"]):                    # weakest first, best mode on top
+            color = HIVT_MODE_COLORS[mode["rank"] % len(HIVT_MODE_COLORS)]
+            pts = segments(mode["points"], color, 3 if mode["rank"] == 0 else 1)
+            if mode["rank"] == 0:
+                for j in range(steps_per_second, len(pts), steps_per_second):   # one dot per second ahead
+                    p = pts[j]
+                    if p is not None and 0 <= p[0] < w and 0 <= p[1] < h:
+                        cv2.circle(image, p, 5, color, -1, cv2.LINE_AA)
+                        cv2.circle(image, p, 6, (0, 0, 0), 1, cv2.LINE_AA)
+                tip, tail = pts[-1], pts[max(0, len(pts) - 4)]
+                if (tip is not None and tail is not None and 0 <= tip[0] < w and 0 <= tip[1] < h
+                        and 0 <= tail[0] < w and 0 <= tail[1] < h and tip != tail):
+                    cv2.arrowedLine(image, tail, tip, color, 3, cv2.LINE_AA, tipLength=0.6)
+        tip = _hivt_px(best["points"][-1], w, h)
+        if tip is not None:
+            text = f"BT{item['track_id']} +{item['horizon_s']:.1f}s"
+            (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            tx = max(2, min(w - tw - 6, tip[0] + 8))
+            ty = max(th + 4, min(h - 6, tip[1] + th // 2))
+            cv2.rectangle(image, (tx - 3, ty - th - 3), (tx + tw + 3, ty + base + 1), (0, 0, 0), -1)
+            cv2.putText(image, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        HIVT_MODE_COLORS[0], 1, cv2.LINE_AA)
+
+
+class HiVTClient:
+    """Asynchronous bridge between the live loop and the persistent HiVT worker.
+
+    * observe() is called from the tracking thread after every ByteTrack update. It records the real
+      observations (every update, so no history is lost when inference is slow) and hands the LATEST
+      snapshot to a bounded (size 1, latest-wins) queue. It never waits for HiVT.
+    * A dedicated thread sends one request at a time to the worker and stores the newest result.
+    * paths_for_draw() is called by the display loop; it never blocks and returns only fresh,
+      aligned forecasts for vehicles that are currently drawn.
+    * A dead/failed worker is recorded, shown on screen, and stops further requests: it can never be
+      mistaken for "no hazard / no prediction yet".
+    """
+
+    FAIL_AFTER_CONSECUTIVE_TIMEOUTS = 3
+
+    def __init__(self, worker, stop_event, history, label="HiVT-64", max_age_s=4.0, draw_modes=3,
+                 jsonl_handle=None, request_timeout_s=HIVT_REQUEST_TIMEOUT_S):
+        self.worker, self.stop_event, self.history = worker, stop_event, history
+        self.label, self.max_age_s, self.draw_modes = label, float(max_age_s), int(draw_modes)
+        self.jsonl_handle, self.request_timeout_s = jsonl_handle, float(request_timeout_s)
+        self.queue = queue.Queue(maxsize=1)
+        self._lock = threading.Lock()
+        self.status = "loading"                      # loading | ready | failed
+        self.failure = None
+        self.latest = None
+        self.counts = {"submitted": 0, "replaced_before_inference": 0, "results": 0, "errors": 0,
+                       "timeouts": 0, "tracks_predicted": 0, "tracks_rejected": 0,
+                       "draw_frames_with_paths": 0, "stale_not_drawn": 0, "path_not_drawn": 0}
+        self.reject_reasons = {}
+        self.not_drawn_reasons = {}
+        self.last_error = None
+        self._consecutive_timeouts = 0
+        self.infer_ms, self.total_ms, self.roundtrip_ms = RollingStat(), RollingStat(), RollingStat()
+        self.rate = RateMeter()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="VISENTRA-HiVT")
+
+    # ---- called from the tracking thread ----
+    def observe(self, frame_id, timestamp_s, tracked, image_w, image_h):
+        self.history.update(timestamp_s, tracked.get("boxes"), tracked.get("track_ids"),
+                            (int(image_w), int(image_h)))
+        if self.status == "failed":
+            return
+        payload = self.history.snapshot(timestamp_s)
+        if not payload["tracks"]:
+            return
+        payload["frame_id"] = int(frame_id)
+        replaced = _put_latest(self.queue, payload)
+        with self._lock:
+            self.counts["submitted"] += 1
+            if replaced:
+                self.counts["replaced_before_inference"] += 1
+
+    # ---- HiVT thread ----
+    def _fail(self, reason):
+        with self._lock:
+            first = self.status != "failed"
+            self.status, self.failure = "failed", reason
+        if first and not (SHUTDOWN.is_set() or self.stop_event.is_set()):
+            log_error(f"HiVT trajectory forecasting is DISABLED for the rest of this session: {reason}")
+
+    def _run(self):
+        while True:                                  # wait for the model; the live preview keeps running
+            if self.stop_event.is_set():
+                return
+            if self.worker.has_failed():
+                self._fail(f"HiVT worker failed to start: {self.worker.ready_error}")
+                return
+            if self.worker.is_ready():
+                break
+            if not self.worker.alive():
+                self._fail("HiVT worker exited before it was ready")
+                return
+            time.sleep(0.1)
+        with self._lock:
+            self.status = "ready"
+        while not self.stop_event.is_set():
+            try:
+                payload = self.queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if payload is None:
+                break
+            sent = time.perf_counter()
+            try:
+                message = self.worker.request(payload, timeout=self.request_timeout_s)
+            except WorkerShutdownError:
+                break
+            except WorkerExitedError as exc:
+                self._fail(str(exc))
+                break
+            except TimeoutError as exc:
+                with self._lock:
+                    self.counts["timeouts"] += 1
+                    self.last_error = str(exc)
+                self._consecutive_timeouts += 1
+                log_warn_once("hivt_timeout", f"HiVT: {exc}")
+                if self._consecutive_timeouts >= self.FAIL_AFTER_CONSECUTIVE_TIMEOUTS:
+                    self._fail(f"{self._consecutive_timeouts} consecutive request timeouts")
+                    break
+                continue
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self.counts["errors"] += 1
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                log_warn_once(f"hivt_req:{type(exc).__name__}", f"HiVT request error: {exc}")
+                continue
+            self._consecutive_timeouts = 0
+            done = time.perf_counter()
+            if message.get("error"):
+                with self._lock:
+                    self.counts["errors"] += 1
+                    self.last_error = str(message["error"])
+                log_warn_once(f"hivt_msg:{message['error'][:60]}", f"HiVT worker error: {message['error']}")
+                continue
+            self._accept(payload, message, (done - sent) * 1000.0, done)
+
+    def _accept(self, payload, message, roundtrip_ms, done):
+        by_track, rejected = {}, {}
+        for pred in message.get("predictions") or []:
+            try:
+                tid = int(pred["track_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if pred.get("valid") and pred.get("modes"):
+                by_track[tid] = pred
+            else:
+                rejected[tid] = str(pred.get("reason", "unknown"))
+        with self._lock:
+            self.latest = {"frame_id": payload["frame_id"], "timestamp_s": float(payload["timestamp_s"]),
+                           "completed_at": done, "by_track": by_track, "rejected": rejected}
+            self.counts["results"] += 1
+            self.counts["tracks_predicted"] += len(by_track)
+            self.counts["tracks_rejected"] += len(rejected)
+            for reason in rejected.values():
+                self.reject_reasons[reason] = self.reject_reasons.get(reason, 0) + 1
+            if message.get("infer_ms") is not None:
+                self.infer_ms.add(message["infer_ms"])
+            if message.get("total_ms") is not None:
+                self.total_ms.add(message["total_ms"])
+            self.roundtrip_ms.add(roundtrip_ms)
+            self.rate.tick(done)
+        if self.jsonl_handle is not None:
+            try:
+                self.jsonl_handle.write(json.dumps({
+                    "frame_id": payload["frame_id"], "timestamp_s": payload["timestamp_s"],
+                    "image_size": payload.get("image_size"), "model": self.label,
+                    "coordinate_space": "image_plane_pseudo_metric_experimental_not_metric",
+                    "build_ms": message.get("build_ms"), "infer_ms": message.get("infer_ms"),
+                    "total_ms": message.get("total_ms"), "roundtrip_ms": round(roundtrip_ms, 2),
+                    "predictions": message.get("predictions"),
+                }, separators=(",", ":")) + "\n")
+                self.jsonl_handle.flush()
+            except (OSError, ValueError, TypeError) as exc:
+                log_warn_once("hivt_jsonl", f"could not write the HiVT JSONL record: {exc}")
+
+    # ---- called from the display loop ----
+    def paths_for_draw(self, detections, display_ts, now):
+        """Forecasts for vehicles currently drawn, time-aligned to the displayed frame (captured at
+        display_ts). Returns [] unless a fresh, valid forecast exists for that vehicle's ByteTrack ID."""
+        with self._lock:
+            latest, status = self.latest, self.status
+        if status == "failed" or latest is None or display_ts is None:
+            return []
+        age = now - latest["timestamp_s"]
+        if age > self.max_age_s:
+            with self._lock:
+                self.counts["stale_not_drawn"] += 1
+            return []
+        paths = []
+        for tid, box in zip(detections.get("track_ids") or [], detections.get("boxes") or []):
+            if tid is None:
+                continue
+            pred = latest["by_track"].get(int(tid))
+            if pred is None:
+                continue
+            verdict, path = align_hivt_path(pred, box, display_ts, self.draw_modes)
+            if verdict == "ok":
+                paths.append(path)
+            else:
+                with self._lock:
+                    self.counts["path_not_drawn"] += 1
+                    self.not_drawn_reasons[verdict] = self.not_drawn_reasons.get(verdict, 0) + 1
+        if paths:
+            with self._lock:
+                self.counts["draw_frames_with_paths"] += 1
+        return paths
+
+    def status_lines(self, now, paths_drawn):
+        with self._lock:
+            status, failure, latest = self.status, self.failure, self.latest
+            infer, rate = self.infer_ms.mean(), self.rate.fps()
+            counts = dict(self.counts)
+            reasons = dict(latest["rejected"]) if latest else {}
+        if status == "failed":
+            return [f"{self.label} FAILED: {failure} - forecasts disabled (no forecast means UNKNOWN)"]
+        if status == "loading":
+            return [f"{self.label}: loading model..."]
+        age = (now - latest["timestamp_s"]) if latest else None
+        lines = [f"{self.label} EXPERIMENTAL image-plane forecast (not metric): {paths_drawn} path(s) drawn | "
+                 f"model {_fmt(infer, '.0f', ' ms')} | {_fmt(rate, '.2f')} updates/s | "
+                 f"result age {_fmt(age, '.1f', 's')}"]
+        if latest is not None and not latest["by_track"]:
+            why = ", ".join(f"{k}x{list(reasons.values()).count(k)}" for k in sorted(set(reasons.values())))
+            lines.append(f"HiVT: no vehicle has enough history yet ({why or 'no tracks'})")
+        if counts["errors"] or counts["timeouts"]:
+            lines.append(f"HiVT errors {counts['errors']} / timeouts {counts['timeouts']}; check console")
+        return lines
+
+    def close(self):
+        """Wake the HiVT thread so it can exit (the session's stop_event is owned by master_live)."""
+        _put_latest(self.queue, None)
+
+    def summary_lines(self):
+        with self._lock:
+            c = dict(self.counts)
+            lines = [
+                f"{self.label} (experimental image-plane forecasts): final status {self.status}"
+                + (f" - {self.failure}" if self.failure else ""),
+                f"  requests submitted {c['submitted']} (replaced before inference {c['replaced_before_inference']}), "
+                f"results {c['results']}, errors {c['errors']}, timeouts {c['timeouts']}",
+                f"  model time mean {_fmt(self.infer_ms.mean_all(), '.1f', ' ms')} | worker total "
+                f"{_fmt(self.total_ms.mean_all(), '.1f', ' ms')} | round trip "
+                f"{_fmt(self.roundtrip_ms.mean_all(), '.0f', ' ms')} | update rate "
+                f"{_fmt(self.rate.fps(), '.2f', '/s')}",
+                f"  track forecasts produced {c['tracks_predicted']}, rejected {c['tracks_rejected']} "
+                f"{self.reject_reasons or ''}",
+                f"  display frames with a path {c['draw_frames_with_paths']}; not drawn because stale "
+                f"{c['stale_not_drawn']}, other {c['path_not_drawn']} {self.not_drawn_reasons or ''}",
+            ]
+            if self.last_error:
+                lines.append(f"  last error: {self.last_error}")
+        stats = self.history.stats
+        lines.append(f"  history: {stats}")
+        return lines
+
+
 PERF_CSV_FIELDS = [
     "elapsed_s", "capture_fps", "display_fps",
     "rf_fps", "rf_worker_ms", "rf_roundtrip_ms",
@@ -3070,7 +3448,8 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                 threads=None, lane_every=1, metric_every=1, enable_deepsort=False,
                 detection_max_age=DETECTION_STALE_SECONDS, lane_max_age=LANE_STALE_SECONDS,
                 emp_export_path=None, lane_assoc_max_age=LANE_ASSOC_MAX_AGE_S,
-                bt_buffer=None, bt_match=None, bt_activation=None):
+                bt_buffer=None, bt_match=None, bt_activation=None,
+                hivt_options=None, save_annotated=None):
     """Responsive live or recorded-video preview. One input, one worker per model, bounded queues.
 
     lane_every / metric_every: send every N-th completed RF-DETR frame to CurveLaneS / Metric3D
@@ -3093,6 +3472,8 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
     )
 
     check_paths(require_lane=with_lanes, require_camera=(video_path is None))
+    if hivt_options:
+        check_hivt_paths(hivt_options["variant"])
     cv2.setNumThreads(1)
     if video_path is None and camera_index not in (0, None):
         log_warn("--camera is ignored: the direct Vivo camera stream is used instead of a webcam index.")
@@ -3130,6 +3511,12 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
     workers = {}
     threads_list = []
     latest_annotated = None
+    hivt_client = None           # HiVTClient when --with-hivt is used
+    hivt_output_handle = None
+    video_writer = None          # --save-annotated
+    writer_frames_written = 0
+    writer_t0 = None
+    out_fps = 15.0
     bytetrack = None
     deepsort_tracker = None
     csv_handle = None
@@ -3334,6 +3721,13 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                                 "confidences": [float(v) for v in (tracked.get("confidences") or [])],
                             },
                         }
+                if hivt_client is not None:
+                    try:
+                        # Real ByteTrack IDs + capture timestamp of THIS frame; returns immediately.
+                        hivt_client.observe(frame_id, observation_ts, tracked,
+                                            frame.shape[1], frame.shape[0])
+                    except Exception as hivt_exc:  # noqa: BLE001 - HiVT must never break tracking
+                        log_warn_once(f"hivt_observe:{hivt_exc}", f"HiVT history update failed: {hivt_exc}")
             except Exception as exc:  # noqa: BLE001
                 with state_lock:
                     state["track"]["error"] = str(exc)
@@ -3474,6 +3868,36 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
         for name in worker_names:
             workers[name] = StreamWorker(name, depth_scale, threads=threads, warmup_size=warmup_size)
 
+        if hivt_options:
+            try:
+                hivt_adapter_dir = str(HIVT_ADAPTER_SCRIPT.parent)
+                if hivt_adapter_dir not in sys.path:
+                    sys.path.insert(0, hivt_adapter_dir)
+                from visentra_hivt_adapter import HiVTTrackHistory
+            except ImportError as exc:
+                raise RuntimeError(f"--with-hivt needs {HIVT_ADAPTER_SCRIPT} next to visentra.py: {exc}")
+            variant = hivt_options["variant"]
+            log_info(f"Starting the HiVT-{variant} trajectory worker (EXPERIMENTAL image-plane forecasting; "
+                     "not metric, not calibrated)...")
+            hivt_command = [
+                str(HIVT_PYTHON), str(HIVT_WORKER_SCRIPT),
+                "--repo", str(HIVT_ROOT), "--variant", str(variant),
+                "--checkpoint", str(hivt_checkpoint(variant)),
+                "--dt", str(hivt_options["dt"]), "--image-width-m", str(hivt_options["image_width_m"]),
+                "--max-gap", str(hivt_options["max_gap"]), "--min-obs", str(hivt_options["min_obs"]),
+                "--max-agents", str(hivt_options["max_agents"]),
+                "--threads", str(hivt_options["threads"]),
+            ]
+            workers["hivt"] = StreamWorker("hivt", command=hivt_command,
+                                           threads={"hivt": hivt_options["threads"]})
+            hivt_output_path = OUTPUT_DIR / f"hivt_live_{SESSION_TAG}.jsonl"
+            hivt_output_handle = hivt_output_path.open("w", encoding="utf-8")
+            log_info(f"HiVT forecasts (JSONL): {hivt_output_path}")
+            hivt_client = HiVTClient(
+                workers["hivt"], stop_event, HiVTTrackHistory(anchor=hivt_options["anchor"]),
+                label=f"HiVT-{variant}", max_age_s=hivt_options["max_age"],
+                draw_modes=hivt_options["draw_modes"], jsonl_handle=hivt_output_handle)
+
         import supervision as sv
 
         # ByteTrack is always enabled.
@@ -3496,6 +3920,8 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
             for name in worker_names
         ]
         threads_list.append(threading.Thread(target=track_loop, daemon=True, name="VISENTRA-Tracking"))
+        if hivt_client is not None:
+            threads_list.append(hivt_client.thread)
         for thread in threads_list:
             thread.start()
 
@@ -3714,14 +4140,55 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                 status_lines.append(
                     f"CPU {_fmt(monitor.cpu, '.0f', '%')} | RAM (all processes) {_fmt(monitor.ram_mb, '.0f', ' MB')}")
 
+            hivt_paths = []
+            if hivt_client is not None:
+                if tracked_fresh:
+                    hivt_paths = hivt_client.paths_for_draw(
+                        detections_for_draw, capture_ts.get(frame_number), now)
+                status_lines.extend(hivt_client.status_lines(now, len(hivt_paths)))
             latest_annotated = draw_results(
                 frame, detections_for_draw, lanes_now,
                 distances=distances, depth_scale=depth_scale,
                 frame_number=frame_number, fps=display_fps,
                 status_lines=status_lines, lanes_enabled=with_lanes,
             )
+            if hivt_paths:
+                try:
+                    draw_hivt_paths(latest_annotated, hivt_paths)
+                except Exception as draw_exc:  # noqa: BLE001 - a drawing problem must not stop the preview
+                    log_warn_once(f"hivt_draw:{draw_exc}", f"could not draw HiVT paths: {draw_exc}")
             cv2.imshow(window_name, latest_annotated)
             shown_at = time.perf_counter()
+            if save_annotated:
+                try:
+                    if video_writer is None and writer_t0 is None:
+                        out_fps = float(source_fps or camera_fps or 15)
+                        out_file = Path(save_annotated).expanduser()
+                        out_file.parent.mkdir(parents=True, exist_ok=True)
+                        fh, fw = latest_annotated.shape[:2]
+                        candidate_writer = cv2.VideoWriter(
+                            str(out_file), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (fw, fh))
+                        if not candidate_writer.isOpened():
+                            candidate_writer.release()
+                            video_writer = None
+                            save_annotated = None
+                            log_warn_once("save_annotated_open",
+                                          f"could not open the output video for writing: {out_file}")
+                        else:
+                            video_writer = candidate_writer
+                            writer_t0 = shown_at
+                            log_info(f"Saving the annotated video ({fw}x{fh}, {out_fps:.1f} FPS, real-time "
+                                     f"timing) to {out_file}")
+                    if video_writer is not None:
+                        # Constant output FPS on the real-time axis: repeat a frame if the display was
+                        # slower than the nominal rate, skip one if it was faster.
+                        due = int((shown_at - writer_t0) * out_fps) + 1
+                        for _ in range(max(0, due - writer_frames_written)):
+                            video_writer.write(latest_annotated)
+                            writer_frames_written += 1
+                except Exception as write_exc:  # noqa: BLE001
+                    log_warn_once("save_annotated", f"saving the annotated video failed: {write_exc}")
+                    save_annotated = None
             perf.tick("display", shown_at)
             if tracked_fresh and tracked_fid != last_displayed_fid:
                 # First time this detection result reaches the screen: capture -> display delay.
@@ -3756,6 +4223,8 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
         stop_event.set()
         for work_queue in queues.values():
             _put_latest(work_queue, None)
+        if hivt_client is not None:
+            hivt_client.close()
         # Ask every worker to finish first (stdin EOF = clean exit) so they stop in parallel.
         for worker in workers.values():
             try:
@@ -3779,6 +4248,23 @@ def master_live(camera_index=0, width=640, height=480, depth_scale=DEFAULT_DEPTH
                 log_warn(f"{worker.name} worker cleanup failed: {exc}")
         for thread in threads_list:
             thread.join(timeout=2)
+        if hivt_client is not None:
+            for line in hivt_client.summary_lines():
+                log_info(line)
+            alive_after = [t.name for t in threads_list if t.is_alive()]
+            if alive_after:
+                log_warn(f"threads still running after cleanup: {alive_after}")
+        if hivt_output_handle is not None:
+            try:
+                hivt_output_handle.close()
+            except OSError:
+                pass
+        if video_writer is not None:
+            try:
+                video_writer.release()
+                log_info(f"Annotated video closed ({writer_frames_written} frames written).")
+            except Exception as exc:  # noqa: BLE001
+                log_warn(f"could not close the annotated video: {exc}")
         try:
             cv2.destroyAllWindows()
         except cv2.error:
@@ -3958,12 +4444,52 @@ def main():
                              "switches before changing it.")
     parser.add_argument("--bt-match", type=float, default=None,
                         help="ByteTrack minimum matching threshold (default: library default)")
+    parser.add_argument("--with-hivt", action="store_true",
+                        help="EXPERIMENTAL: forecast each tracked vehicle's path with HiVT (runs in its own "
+                             "process/environment) and draw it on the video. Image-plane forecast, not metric.")
+    parser.add_argument("--hivt-model", choices=["64", "128"], default="64",
+                        help="HiVT checkpoint size (default 64; 128 is slower on CPU)")
+    parser.add_argument("--hivt-max-age", type=float, default=4.0,
+                        help="Do not draw a HiVT forecast older than this many seconds (default 4.0)")
+    parser.add_argument("--hivt-draw-modes", type=int, default=3, metavar="N",
+                        help="Draw the N most probable of HiVT's 6 modes (1-6, default 3)")
+    parser.add_argument("--hivt-threads", type=int, default=2,
+                        help="CPU threads for the HiVT worker (default 2)")
+    parser.add_argument("--hivt-image-width-m", type=float, default=30.0,
+                        help="Pseudo-metres spanned by the full image width in HiVT's experimental "
+                             "image-plane coordinates (default 30; NOT a calibrated distance)")
+    parser.add_argument("--hivt-dt", type=float, default=0.1,
+                        help="HiVT time step in seconds (trained at 0.1)")
+    parser.add_argument("--hivt-min-obs", type=int, default=3,
+                        help="Minimum REAL observations supporting a history window (default 3)")
+    parser.add_argument("--hivt-max-gap", type=float, default=1.5,
+                        help="Largest gap between real observations that may be interpolated (default 1.5 s)")
+    parser.add_argument("--hivt-max-agents", type=int, default=12,
+                        help="Most vehicles forecast together per update (default 12)")
+    parser.add_argument("--hivt-anchor", choices=["bottom", "center"], default="bottom",
+                        help="Box point used as the vehicle position: bottom-centre (ground contact, "
+                             "default) or box centre")
+    parser.add_argument("--record", action="store_true",
+                        help="Record annotated live video as MP4 under outputs/recordings")
+    parser.add_argument("--save-annotated", default=None, metavar="FILE.mp4",
+                        help="Also write the annotated video (with forecasts) to this file")
     parser.add_argument("--bt-activation", type=float, default=None,
                         help="ByteTrack activation threshold (default: library default)")
     args = parser.parse_args()
 
+    if args.record and not args.live:
+        parser.error("--record requires --live")
+    if args.record and args.save_annotated:
+        parser.error("use either --record or --save-annotated, not both")
+
     if args.lane_assoc_max_age <= 0:
         parser.error("--lane-assoc-max-age must be positive")
+    if not (1 <= args.hivt_draw_modes <= 6):
+        parser.error("--hivt-draw-modes must be between 1 and 6")
+    if args.hivt_max_age <= 0 or args.hivt_dt <= 0 or args.hivt_image_width_m <= 0 or args.hivt_max_gap <= 0:
+        parser.error("--hivt-max-age, --hivt-dt, --hivt-image-width-m and --hivt-max-gap must be positive")
+    if args.hivt_min_obs < 2 or not (1 <= args.hivt_max_agents <= 64) or not (1 <= args.hivt_threads <= 32):
+        parser.error("--hivt-min-obs must be >= 2, --hivt-max-agents 1-64, --hivt-threads 1-32")
 
     if not np.isfinite(args.depth_scale) or args.depth_scale <= 0:
         parser.error("--depth-scale must be a positive finite number")
@@ -4015,6 +4541,12 @@ def main():
         )
         return
 
+    recording_output = None
+    if args.record:
+        recording_dir = OUTPUT_DIR / "recordings"
+        recording_dir.mkdir(parents=True, exist_ok=True)
+        recording_output = recording_dir / f"visentra_live_{SESSION_TAG}.mp4"
+
     live_options = dict(
         depth_scale=args.depth_scale,
         with_lanes=args.with_lanes,
@@ -4029,6 +4561,12 @@ def main():
         bt_buffer=args.bt_buffer,
         bt_match=args.bt_match,
         bt_activation=args.bt_activation,
+        hivt_options=(dict(
+            variant=args.hivt_model, max_age=args.hivt_max_age, draw_modes=args.hivt_draw_modes,
+            threads=args.hivt_threads, image_width_m=args.hivt_image_width_m, dt=args.hivt_dt,
+            min_obs=args.hivt_min_obs, max_gap=args.hivt_max_gap, max_agents=args.hivt_max_agents,
+            anchor=args.hivt_anchor) if args.with_hivt else None),
+        save_annotated=(str(recording_output) if recording_output is not None else args.save_annotated),
     )
 
     if args.video_dir is not None:
@@ -4051,6 +4589,10 @@ def main():
             print(f"\n========== VIDEO {index}/{len(videos)}: {video_path.name} ==========", flush=True)
             try:
                 video_options = dict(live_options)
+                if args.save_annotated:
+                    base_video = Path(args.save_annotated).expanduser()
+                    video_options["save_annotated"] = str(base_video.with_name(
+                        f"{base_video.stem}_{video_path.stem}{base_video.suffix or '.mp4'}"))
                 if args.emp_export:
                     base_export = Path(args.emp_export).expanduser()
                     suffix = base_export.suffix or ".jsonl"

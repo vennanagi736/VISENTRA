@@ -1,0 +1,3 @@
+[submodule "research_models/HiVT"]
+	path = research_models/HiVT
+	url = https://github.com/ZikangZhou/HiVT.git
