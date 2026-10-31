@@ -1,486 +1,561 @@
 
 
-Readme · MD
-VISENTRA
-Vision-Based Vehicle, Lane, and Distance-Awareness Research Pipeline
-VISENTRA is a computer vision project exploring how a road-facing camera can be used to detect vehicles, track them across frames, identify lane boundaries, estimate approximate vehicle distances, and investigate camera-based driving-assistance features.
+# VISENTRA
+## Vision-Based Vehicle, Lane, Distance, and Trajectory-Awareness Research Pipeline
 
-The project combines RF-DETR for vehicle detection, ByteTrack for multi-frame vehicle tracking, CurveLaneS / CondLaneNet for lane detection, and a separate MonoPilot experimental pipeline for monocular depth estimation and distance analysis.
+VISENTRA is a computer vision research project exploring how a road-facing camera can be used to detect vehicles, track them across frames, estimate lane boundaries, investigate approximate vehicle distances, and predict short-term vehicle motion.
 
-The project is designed to investigate camera-only road awareness — using a phone camera or a compatible webcam — without relying on additional radar or lidar sensors.
+The project combines **RF-DETR** for vehicle detection, **ByteTrack** for multi-frame tracking, **CurveLaneS / CondLaneNet** for lane detection, **Metric3D** for experimental monocular depth estimation, and a **Kalman-filter-based trajectory predictor** for short-term motion forecasting.
 
-Project status: Research and prototyping. Vehicle detection, tracking, lane detection, distance estimation, live-video processing, and virtual-corridor event logic have different levels of validation. The complete system is not safety-certified.
+Additional depth-estimation and trajectory-prediction approaches are investigated separately. These include the MonoPilot depth-processing workstream and HiVT experiments, which must not be confused with components confirmed as integrated into the main pipeline.
 
-1. Why VISENTRA?
-Vehicles often need awareness of nearby traffic, road boundaries, and the relative positions of other vehicles. Dedicated sensors can provide distance measurements, but they can also increase hardware cost and integration complexity.
+VISENTRA investigates camera-only road awareness using a phone camera or compatible webcam, without requiring radar or lidar as core inputs.
 
-VISENTRA investigates how much useful information can be obtained from a camera alone.
+**Project status:** Research and prototyping. Detection, tracking, lane estimation, depth estimation, trajectory prediction, and virtual-corridor logic have different levels of validation. The complete system is not safety-certified.
+
+---
+
+## 1. Why VISENTRA?
+
+Vehicles need awareness of nearby traffic, road boundaries, and the relative positions of surrounding vehicles. Dedicated sensors can provide additional measurements, but they also introduce hardware and integration requirements.
+
+VISENTRA investigates how much useful road information can be obtained from camera imagery and temporal computer vision.
 
 The main objectives are:
 
-Vehicle detection: Identify vehicles visible in the camera frame.
-Vehicle tracking: Associate vehicle detections across frames to maintain consistent identities over time.
-Lane detection: Estimate road-lane curves and visualize the apparent driving corridor.
-Distance estimation: Investigate approximate vehicle range using monocular depth estimation.
-Relative-position analysis: Explore whether detected vehicles are positioned to the left, right, or center of the camera view.
-Virtual corridor: Experiment with defining a road region and detecting objects within or around it.
-Event logic: Investigate timed responses to vehicle positions and multiple-object scenarios.
-Low-cost implementation: Test the models using a Windows laptop and a phone camera or compatible webcam.
-The long-term objective is to develop a camera-based road-awareness prototype that can provide useful visual information while keeping hardware requirements low.
+- **Vehicle detection:** Identify vehicles visible in camera frames.
+- **Vehicle tracking:** Associate detections across frames and maintain track identities.
+- **Lane detection:** Estimate lane curves and visualize the apparent road corridor.
+- **Distance estimation:** Investigate approximate vehicle range using monocular depth estimation.
+- **Relative-position analysis:** Examine whether vehicles appear to the left, right, or center of the image.
+- **Trajectory prediction:** Experiment with forecasting short-term vehicle motion from tracked observations.
+- **Virtual corridor:** Investigate vehicle positions relative to a configurable image-space region.
+- **Event logic:** Explore timed responses to persistent vehicle observations and multiple-object scenarios.
+- **Performance evaluation:** Measure inference speed, processing throughput, skipped frames, and latency.
 
-2. System Architecture
-VISENTRA contains two related but separate computer vision workstreams.
+The long-term objective is to develop a low-cost, camera-based road-awareness prototype while measuring its limitations under repeatable test conditions.
 
-A. Vehicle detection, tracking, and lane detection
-text
-                       VISENTRA
-                          |
-                          v
-                    Road Camera Frame
-                          |
-                          v
-                       RF-DETR
-                   Vehicle Detection
-                          |
-                          v
-                  Vehicle Bounding Boxes
-                          |
-                          v
-                      ByteTrack
-             Multi-Frame Vehicle Tracking
-                          |
-                          v
-                 Tracked Vehicle IDs
-                          |
-             +------------+------------+
-             |                         |
-             v                         v
-      Tracked Vehicles          CurveLaneS /
-                                  CondLaneNet
-                                 Lane Detection
-             |                         |
-             v                         v
-       Vehicle Positions          Lane Curves
-             |                         |
-             +------------+------------+
-                          |
-                          v
-                   Result Fusion /
-                 Visualization of
-                Available Outputs
-B. Monocular distance estimation
-text
-                Camera Image
-                     |
-                     v
-             Vehicle Detection
-                     |
-                     v
-              Vehicle Bounding Box
-                     |
-                     v
-           Metric Depth Estimation
-                     |
-                     v
-          Depth and Geometry Analysis
-                     |
-                     v
-           Approximate Range Estimate
-                     |
-                     v
-          Ground-Truth Error Evaluation
-The two workstreams address different problems. Detection, tracking, and lane models provide object, identity, and road information, while MonoPilot investigates whether a single camera can provide useful metric-distance estimates — as a separate, experimental depth-processing workstream. Not every component runs simultaneously, and not every output listed above has the same level of validation; see the sections below for what has been tested.
+## 2. System Architecture
 
-3. Vehicle Detection — RF-DETR
-RF-DETR is used to detect vehicles in road images and video frames.
+VISENTRA contains related but distinct perception and experimentation workstreams.
 
-Its output includes detected objects, bounding boxes, and the class and confidence information supported by the model.
+### A. Main vehicle and lane perception pipeline
 
-Why RF-DETR?
-Vehicle detection provides the object locations needed for subsequent analysis. For example, a detected vehicle's image position can be used to investigate whether it appears to the left, right, or center of the camera view, and its bounding box is the input that ByteTrack associates across frames.
+```text
+                   Road Camera Frame
+                           |
+                           v
+                        RF-DETR
+                    Vehicle Detection
+                           |
+                           v
+                 Vehicle Bounding Boxes
+                           |
+                           v
+                       ByteTrack
+                 Multi-Frame Tracking
+                           |
+                           v
+                  Tracked Vehicle IDs
+                           |
+              +------------+------------+
+              |            |            |
+              v            v            v
+        Vehicle State   CurveLaneS   Frame-Order
+         and History    / CondLaneNet  Safeguard
+              |          Lane Curves       |
+              v               |            |
+       Trajectory Predictor   |            |
+       (Kalman-based)         |            |
+              |               |            |
+              +---------------+------------+
+                              |
+                              v
+                   Visualization and
+                  Experimental Analysis
+```
 
-Current implementation
-RF-DETR model integration.
-Separate Python environment for dependency compatibility.
-Worker-based execution in the main pipeline.
-Experimental live-processing variants.
-Vehicle bounding-box visualization.
-Diagnostic scripts for checking detection behavior.
-Detection accuracy and inference speed must be measured under the intended camera conditions.
+The tracking frame-order safeguard prevents the tracking loop from processing a frame whose ID is not newer than the latest processed frame. It is a pipeline reliability measure, not an additional AI model.
 
-4. Vehicle Tracking — ByteTrack
-ByteTrack is used in the main pipeline to associate RF-DETR vehicle detections across successive frames.
+### B. Monocular depth-estimation workstream
 
-Why tracking?
-A detector alone reports vehicles independently in every frame, with no notion of which detection in frame N corresponds to which detection in frame N+1. Tracking addresses this by:
+```text
+                    Camera Image
+                         |
+                         v
+                 Vehicle Detection
+                         |
+                         v
+                Vehicle Image Region
+                         |
+                         v
+              Metric Depth Estimation
+                         |
+                         v
+               Depth and Geometry
+                    Analysis
+                         |
+                         v
+              Approximate Range Estimate
+                         |
+                         v
+               Ground-Truth Evaluation
+```
 
-Maintaining vehicle identities over time — assigning a consistent ID to the same physical vehicle as it moves across frames, instead of treating it as a new object each time.
-Supporting temporal analysis — downstream experiments that need to reason about a vehicle's behavior over several frames (rather than a single snapshot) depend on having a stable identity to follow.
-Feeding the virtual-corridor and event-processing experiments — visentra_virtual_corridor_events.py uses tracked vehicle identities, instead of raw per-frame detections, to investigate whether a given vehicle persists within or near the defined corridor over time and to drive event timing.
-Limitations
-Missed detections: If RF-DETR fails to detect a vehicle in a given frame, ByteTrack has no detection to associate, which can break or shorten a track.
-ID switches: Two vehicles passing close together, or a vehicle briefly leaving and re-entering the frame, can cause the tracker to swap or reassign identities.
-Occlusion: A vehicle temporarily hidden behind another object can lose its track or be reassigned a new ID when it reappears.
-Camera movement: Camera motion (e.g., a handheld phone or a vehicle-mounted setup) changes the apparent motion of all objects in the frame, which can affect association quality.
-Tracking instability: Track IDs, bounding boxes, and track lifetimes can fluctuate between frames, particularly at lower detection confidence or frame rates.
-Tracking alone does not measure accurate distance, relative speed, or collision risk. It provides consistent identities and image-space positions over time; any distance, speed, or risk claim requires the separate depth-estimation and calibration work described below, combined with careful temporal analysis — none of which is implied by tracking by itself.
+The main pipeline uses Metric3D for experimental depth estimation. MonoPilot also contains separate depth-model experiments. Their outputs and validation results should be documented independently unless a specific implementation connects them.
 
-5. Lane Detection — CurveLaneS / CondLaneNet
-CurveLaneS / CondLaneNet is used to estimate lane curves from road images.
+### C. Trajectory-prediction workstream
 
-The estimated curves can be overlaid on the camera frame to visualize the apparent road corridor.
+```text
+                  Tracked Vehicle
+                         |
+                         v
+               Timestamped Observations
+                         |
+                         v
+            Kalman-Based State Estimation
+                         |
+                         v
+                Short-Term Forecast
+                         |
+                         v
+              Prediction Error Evaluation
+```
 
-Why lane detection?
-Lane information provides road context that vehicle detection and tracking alone cannot supply. It can help investigate whether a tracked vehicle appears inside, outside, or near a defined corridor.
+Trajectory prediction uses past observations to estimate possible future image-space positions. It does not independently establish actual road-relative velocity, collision risk, or a safe maneuver.
 
-Current implementation
-CondLaneNet model integration.
-CurveLaneS configuration and model loading.
-Separate Python environment for compatibility with the lane model's dependencies.
-Lane inference and curve visualization.
-Experimental integration with vehicle detections.
-Lane detection is affected by lighting, road markings, shadows, occlusion, camera angle, and road geometry. Estimated lane curves should not automatically be treated as exact road boundaries.
+Not every component runs simultaneously, and the presence of a model or script in the repository does not establish successful integration.
 
-6. Separate Python Environments
-The perception models have different dependency requirements. VISENTRA therefore uses separate environments rather than attempting to install every model into one Python environment.
+## 3. Vehicle Detection — RF-DETR
 
-Component	Environment or location	Purpose
-RF-DETR	environments/rfdetr_env/	Vehicle detection
-ByteTrack	Main pipeline environment	Multi-frame vehicle tracking
-CondLaneNet	environments/condlanenet_env/	Lane detection
-MonoPilot	MonoPilot/.venv/, if configured	Depth and distance experiments
-The main application coordinates the model workers and combines their outputs.
+RF-DETR detects vehicles and other supported object classes in road images and video frames.
 
-This separation helps prevent dependency conflicts and allows individual models to be tested independently.
+Its outputs include bounding boxes, class labels, and confidence scores.
 
-The paths shown are from the current Windows development setup. They may need adjustment on another computer.
+### Role in VISENTRA
 
-7. MonoPilot — Monocular Depth and Distance Estimation
-MonoPilot is the experimental distance-estimation workstream under MonoPilot/.
+Detection provides the object locations required for tracking and subsequent analysis. The bounding boxes are passed to ByteTrack to associate detections across frames.
 
-It investigates whether a single camera can estimate the approximate distance to a detected vehicle without a dedicated distance sensor. This workstream is separate from the main RF-DETR / ByteTrack / lane-detection pipeline described above.
+### Current implementation
 
-Main components
-YOLO11n ONNX: Vehicle detection.
-Metric Depth Anything V2 ONNX: Monocular metric-depth prediction.
-Geometric processing: Analysis of depth and image-coordinate relationships.
-Calibration options: Configurable parameters used to investigate distance errors.
-Diagnostic tools: Scripts for examining model outputs, vehicle positions, depth values, and estimated ranges.
-Benchmark tools: Experiments for evaluating inference speed and processing behavior.
-Why combine detection and depth estimation?
-A vehicle detector identifies an object and its approximate image location. A depth model provides depth information for the image.
+- RF-DETR model integration in the main pipeline.
+- A separate Python environment for dependency compatibility.
+- Worker-based execution.
+- Vehicle bounding-box visualization.
+- Experimental live-video implementations.
+- Diagnostic and benchmarking scripts.
 
-Combining these outputs allows the project to investigate the distance to a detected vehicle rather than simply identifying its presence.
+Detection performance depends on image resolution, lighting, occlusion, camera position, and inference throughput. Accuracy and speed must be evaluated on representative test data.
 
-However, a model's depth output must be interpreted correctly. Camera-axis depth, commonly represented as Z, is not necessarily the same as the full straight-line distance between the camera and the target.
+## 4. Vehicle Tracking — ByteTrack
 
-The estimated range may also be affected by the selected vehicle pixels, bounding-box placement, camera calibration, target occlusion, and depth-model errors.
+ByteTrack associates detections across successive frames and maintains track identities.
 
-8. Latest Known-Distance Validation
-The latest recorded MonoPilot validation used four still images with known approximate vehicle distances.
+### Why tracking is needed
 
-Test image	Reference distance	Estimated distance	Absolute error
-5m.png	5 m	7.972 m	2.972 m
-10m.png	10 m	13.088 m	3.088 m
-15m.png	15 m	16.356 m	1.356 m
-20m.png	20 m	22.090 m	2.090 m
-Mean absolute error	—	—	2.377 m
-The mean absolute error is calculated as:
+A detector processes individual frames, while tracking attempts to associate observations of the same vehicle over time.
 
-M
-A
-E
-=
-1
-N
-∑
-i
-=
-1
-N
-∣
-d
-i
-p
-r
-e
-d
-i
-c
-t
-e
-d
-−
-d
-i
-r
-e
-f
-e
-r
-e
-n
-c
-e
-∣
-MAE= 
-N
-1
-​
-  
-i=1
-∑
-N
-​
-  
-​
- d 
-i
-predicted
-​
- −d 
-i
-reference
-​
-  
-​
- 
+Tracking supports:
+
+- Maintaining vehicle track IDs.
+- Recording changes in image-space position.
+- Supplying observations to trajectory-prediction experiments.
+- Supporting virtual-corridor and event-processing logic.
+- Evaluating track continuity and recovery after missed detections.
+
+### Tracking frame-order safeguard
+
+The main `visentra.py` tracking loop includes a frame-order safeguard. It records the latest processed frame ID and skips incoming tracking items whose frame IDs are less than or equal to that value.
+
+This is intended to prevent older or duplicate frames from being processed after newer frames.
+
+The safeguard does not increase model inference speed and does not, by itself, prove improved tracking accuracy. Its effect should be evaluated using logs and repeatable video tests.
+
+### Limitations
+
+- **Missed detections:** Missing detections can interrupt a track.
+- **ID switches:** Nearby vehicles may be assigned incorrect or changing identities.
+- **Occlusion:** A partially or fully hidden vehicle may lose its track.
+- **Camera movement:** Camera motion can affect apparent object displacement.
+- **Low processing frequency:** Long gaps between processed observations can weaken temporal consistency.
+- **Frame ordering:** Out-of-order or duplicate observations can interfere with temporal processing if not handled correctly.
+
+ByteTrack alone does not establish accurate physical distance, relative speed, or collision risk.
+
+## 5. Lane Detection — CurveLaneS / CondLaneNet
+
+CurveLaneS / CondLaneNet estimates lane curves from road images.
+
+The predicted curves can be overlaid on frames to visualize the apparent driving corridor.
+
+### Current implementation
+
+- CondLaneNet model integration.
+- CurveLaneS configuration and checkpoint loading.
+- A separate Python environment for compatibility.
+- Lane inference and curve visualization.
+- Experimental use alongside vehicle detections.
+
+Lane estimates can be affected by faded markings, shadows, glare, road curvature, occlusion, lighting, and camera angle. The predicted curves should not be treated as exact road boundaries without additional validation.
+
+## 6. Trajectory Prediction — Kalman-Based Predictor
+
+VISENTRA includes the experimental trajectory predictor implemented in:
+
+`visentra_trajectory_predictor.py`
+
+The predictor uses a Kalman-filter-based, constant-acceleration approach to estimate short-term future vehicle positions from tracked observations.
+
+### Purpose
+
+Detection provides an object's current image-space position. Tracking supplies observations associated with a vehicle over time. The trajectory predictor uses this temporal information to estimate how the observed position might evolve over a short forecast horizon.
+
+Potential uses include:
+
+- Estimating short-term image-space motion.
+- Visualizing predicted vehicle positions.
+- Comparing predicted positions with later observations.
+- Investigating the stability of motion forecasts.
+- Supporting future temporal-analysis experiments.
+
+### Current experimental constraints
+
+The current implementation uses a bounded forecast horizon of up to approximately two seconds, with limits on estimated velocity and acceleration and damping applied to acceleration.
+
+These are stabilization measures for the experimental predictor, not evidence of accurate real-world trajectory forecasting.
+
+Prediction quality depends on track continuity, timestamps, observation frequency, camera movement, and tracking errors. A constant-acceleration model may not capture abrupt braking, steering, lane changes, or complex interactions between vehicles.
+
+The predictor estimates motion in image coordinates unless additional calibrated geometry is applied. Its output must not be interpreted automatically as physical velocity, road-relative trajectory, or collision probability.
+
+### Evaluation requirements
+
+Future evaluation should compare predictions against later observed positions using the same recorded clips and a consistent evaluation method.
+
+Useful measurements include:
+
+- Mean and median position error.
+- Prediction error at different forecast horizons.
+- Number of valid predictions and evaluated observations.
+- Performance when tracks contain missing observations.
+- Sensitivity to timestamp gaps and camera motion.
+
+Preliminary experiments are not a substitute for a larger, repeatable evaluation set.
+
+## 7. Separate Python Environments
+
+The models have different dependency requirements, so VISENTRA uses separate Python environments rather than forcing all dependencies into one installation.
+
+| Component | Environment or location | Purpose |
+|---|---|---|
+| RF-DETR | `environments/rfdetr_env/` | Vehicle detection |
+| ByteTrack | Main pipeline environment | Vehicle tracking |
+| CurveLaneS / CondLaneNet | `environments/condlanenet_env/` | Lane detection |
+| Metric3D | `MonoPilot/.venv/` | Experimental depth estimation |
+| Trajectory predictor | Main pipeline code | Short-term motion forecasting |
+| HiVT experiments | Separate experimental setup | Evaluation of an alternative trajectory-prediction approach |
+
+These paths describe the current Windows development workspace. Other computers may require different paths, dependencies, or configuration.
+
+## 8. MonoPilot — Monocular Depth and Distance Estimation
+
+MonoPilot is a separate experimental workstream for monocular depth and distance estimation.
+
+The goal is to investigate whether a single camera can provide useful approximate distance estimates for detected vehicles.
+
+### Model and processing experiments
+
+The repository has contained experiments involving:
+
+- **Metric3D:** Monocular depth estimation used by the current VISENTRA depth worker.
+- **Depth Anything V2:** Separate depth-model source and experimentation.
+- **YOLO11n ONNX:** Vehicle-detection experiments within the MonoPilot workflow.
+- **Geometric processing:** Analysis of predicted depth, image coordinates, and vehicle regions.
+- **Calibration experiments:** Parameters for investigating range-estimation errors.
+- **Diagnostic and benchmark scripts:** Examination of model outputs, runtime, and estimated ranges.
+
+These components belong to distinct experimental configurations. They should not all be described as one simultaneously active model chain unless the specific tested configuration confirms that integration.
+
+### Why combine detection and depth?
+
+A detector identifies an object and its approximate image region. A depth model estimates depth information for image pixels. Combining them can support experiments that estimate the range of a detected vehicle.
+
+However, camera-axis depth is not necessarily the same as the straight-line distance from the camera to a target. Bounding-box placement, selected pixels, occlusion, camera calibration, and model error can all affect the estimate.
+
+## 9. Known-Distance Validation
+
+A recorded MonoPilot experiment used four still images with approximate reference distances.
+
+| Test image | Reference distance | Estimated distance | Absolute error |
+|---|---:|---:|---:|
+| `5m.png` | 5 m | 7.972 m | 2.972 m |
+| `10m.png` | 10 m | 13.088 m | 3.088 m |
+| `15m.png` | 15 m | 16.356 m | 1.356 m |
+| `20m.png` | 20 m | 22.090 m | 2.090 m |
+| **Mean absolute error** | — | — | **2.377 m** |
+
+Mean absolute error (MAE) is calculated as:
+
+\[
+\mathrm{MAE}=\frac{1}{N}\sum_{i=1}^{N}
+\left|d_i^{\mathrm{predicted}}-d_i^{\mathrm{reference}}\right|
+\]
+
 For the four recorded observations:
 
-M
-A
-E
-=
-2.972
-+
-3.088
-+
-1.356
-+
-2.090
-4
-≈
-2.377
- m
-MAE= 
-4
-2.972+3.088+1.356+2.090
-​
- ≈2.377 m
-What these results mean
-The estimated distances increased with the reference distances across the four tested images.
-All four estimates were greater than their reference distances.
-The mean absolute error was approximately 2.38 metres.
-The 15-metre reference image had the lowest absolute error in this set.
-The results are useful for debugging but do not establish reliable distance measurement across general road scenes.
-This is a small validation set. It is not a statistically representative benchmark, and it does not establish safety for vehicle operation.
+\[
+\mathrm{MAE}=\frac{2.972+3.088+1.356+2.090}{4}
+\approx 2.377\text{ m}
+\]
 
-What still needs improvement?
-Camera-specific calibration.
-Consistent vehicle detection and target selection.
-Reliable conversion from model depth to the required distance measurement.
-Testing across more reference distances and vehicle types.
-Evaluation under different camera positions and road conditions.
-Repeated measurements and statistical error analysis.
-The same calibration settings should be used throughout a test series unless a change is explicitly documented.
+### Interpretation
 
-9. CPU Performance and Live-Video Testing
-The current development setup uses a Windows 11 laptop with an Intel Core i5-1335U processor and no dedicated GPU.
+- Estimated distance increased with the reference distance across these four observations.
+- All four estimates were greater than their reference distances.
+- The mean absolute error was approximately 2.38 metres.
+- The 15-metre image had the lowest absolute error in this set.
 
-The recorded MonoPilot outdoor CPU tests ran at approximately 1.3–1.5 FPS.
+This is a small diagnostic set, not a statistically representative benchmark. It does not establish general distance accuracy or safety for vehicle operation.
 
-This is an offline experimentation result, not a confirmed live-camera frame rate, and it does not include RF-DETR detection or ByteTrack tracking overhead from the main pipeline.
+Further work should include more distances, vehicles, camera positions, lighting conditions, and repeated measurements. Calibration settings should remain consistent within a test series unless a change is documented.
 
-The project has also encountered camera-capture performance limitations during earlier live tests. Camera acquisition, image conversion, model inference, tracking association, result fusion, and display can each contribute to latency.
+## 10. CPU Performance and Recorded-Video Testing
 
-Performance goals
-The longer-term target is to investigate 30–60 FPS processing, but this has not been demonstrated by the current recorded CPU results.
+The current development machine uses Windows 11 and an Intel Core i5-1335U CPU without a dedicated GPU.
 
-Future performance reports should distinguish:
+Earlier MonoPilot outdoor CPU tests ran at approximately 1.3–1.5 FPS. These results refer to that depth-processing experiment, not the complete main pipeline.
 
-Camera capture FPS.
-Vehicle-detection inference time.
-Tracking association time.
-Lane-detection inference time.
-Depth-estimation inference time.
-End-to-end processing FPS.
-Frame-to-display latency.
-Dropped or skipped frames.
-A live window that displays frames successfully does not, by itself, establish that the full pipeline meets real-time requirements.
+Recorded-video tests of the main pipeline have also shown substantial inference latency.
 
-10. Live Processing Variants
-The repository contains experimental implementations intended to investigate different processing approaches.
+One recorded-video baseline produced the following approximate measurements:
 
-File	Purpose
-visentra.py	Main VISENTRA application and orchestration (RF-DETR, ByteTrack, lane detection).
-visentra_live_accurate_low_latency.py	Experimental live-processing implementation focused on accuracy and latency.
-visentra_live_optimized.py	Experimental live-processing optimization.
-visentra_virtual_corridor_events.py	Experimental virtual-corridor and event-processing logic, built on tracked vehicle identities.
-These scripts represent development variants. They should be tested independently before their outputs or performance are considered equivalent.
+| Pipeline component or metric | Observed result |
+|---|---:|
+| RF-DETR inference | 0.96 FPS |
+| CurveLaneS inference | 0.94 FPS |
+| Metric3D inference | 0.56 FPS |
+| Capture/display throughput | 24.98 FPS |
+| Capture-to-display latency | Approximately 1.10 seconds |
 
-Live-camera objective
-The intended workflow is:
+These are measurements from a particular test session, not universal performance figures. They should not be directly compared with results from different videos, resolutions, hardware, or configurations without accounting for those differences.
 
-Obtain frames from a compatible camera.
-Run vehicle detection.
-Track vehicles across frames.
-Estimate lane curves.
-Display the detections, tracks, and lane overlays.
-Investigate vehicle position and distance over successive frames.
-Measure latency and check for unstable detections or tracks.
-The source camera may be a phone's rear-facing camera or another supported webcam. Camera connectivity and frame rate depend on the capture method and device configuration.
+### Performance goals
 
-11. Virtual Corridor and Event Logic
-visentra_virtual_corridor_events.py explores the concept of a virtual corridor around the visible road region.
+The longer-term goal is to investigate 30–60 FPS processing. This target has not been demonstrated for the complete VISENTRA pipeline.
 
-The idea is to use image-space vehicle positions, tracked identities, and estimated road context to investigate possible responses to nearby vehicles.
+Performance reports should distinguish:
 
-Intended experiments
-Determine whether a tracked vehicle appears on the left, right, or center of the camera view.
-Investigate whether the vehicle is within a configured virtual corridor.
-Track observations over time (via ByteTrack identities) instead of making decisions from one frame.
-Experiment with event timing for persistent or multiple vehicle detections.
-Investigate how distance thresholds affect event decisions.
-Why use a virtual corridor?
-A corridor provides a structured region for interpreting tracked vehicle positions relative to the apparent path of the host vehicle. It can help distinguish an object near the visible path from one farther to the side.
+- Camera capture FPS.
+- Detection inference time and FPS.
+- Tracking processing time.
+- Lane-detection inference time and FPS.
+- Depth-estimation inference time and FPS.
+- Trajectory-prediction processing time.
+- End-to-end throughput.
+- Frame-to-display latency.
+- Dropped, skipped, and out-of-order frames.
 
-However, image position is not equivalent to a vehicle's actual road position, and the apparent corridor is not a calibrated three-dimensional safety zone.
+A window that displays frames successfully does not establish that all models are processing those frames at the same rate.
 
-Important limitations
-A single camera does not directly measure the motion or trajectory of another vehicle.
-Relative speed cannot be reliably inferred from one image, and is not reliably established by tracking alone.
-Monocular motion estimation requires temporal information, calibration, and careful treatment of camera movement.
-Detection jitter, ID switches, occlusion, road curvature, and camera mounting can change the apparent vehicle position.
-Event logic must account for uncertainty and false detections.
-Any indicator or warning behavior remains experimental. It must not control actual vehicle movement or replace the driver's direct observation.
+## 11. Live-Processing Variants
 
-12. Proposed Models and Future Evaluation
-MobileNetV3 and DeepSORT are candidates for future evaluation, not confirmed integrated components of the current pipeline.
+The repository contains experimental implementations for investigating different processing approaches.
 
-MobileNetV3
-Proposed potential role: lightweight secondary vehicle classification or feature extraction on top of the existing RF-DETR detections (for example, refining a vehicle category or extracting features for downstream use), to be adopted only if it is shown to add measurable value beyond what the existing detector already provides.
+| File | Purpose |
+|---|---|
+| `visentra.py` | Main application and model orchestration |
+| `visentra_live_accurate_low_latency.py` | Experimental live-processing implementation |
+| `visentra_live_optimized.py` | Experimental live-processing optimization |
+| `visentra_virtual_corridor_events.py` | Virtual-corridor and event-processing experiments |
+| `visentra_trajectory_predictor.py` | Kalman-based trajectory prediction |
+| `evaluate_visentra_trajectories.py` | Experimental trajectory-evaluation utility, if present in the checkout |
 
-DeepSORT
-Proposed as a possible alternative to ByteTrack for multi-frame vehicle tracking. DeepSORT and ByteTrack are not intended to run simultaneously in the main pipeline; any adoption of DeepSORT would be evaluated as a replacement candidate, not an addition.
+These variants should be tested independently. Their accuracy and performance must not be assumed equivalent.
 
-Evaluation requirements
-Any proposed model (MobileNetV3, DeepSORT, or others considered later) must be evaluated against the existing pipeline using comparable test data and metrics before being adopted. This includes:
+The intended live workflow is to acquire camera frames, run detection, track vehicles, estimate lane curves, process available depth outputs, update trajectory forecasts, and display the results. Camera connectivity and throughput depend on the device, resolution, and capture method.
 
-Using the same or equivalent test images/video as the current RF-DETR and ByteTrack components.
-Reporting accuracy, latency, and resource-usage differences relative to the current implementation.
-Confirming the candidate model's dependencies integrate cleanly with the project's existing Python environments.
-No dependencies have been installed, and no application code has been modified, in order to produce this documentation — these models are documented as proposals only.
+## 12. Virtual Corridor and Event Logic
 
-13. Repository Structure
-The following describes the principal files and directories used in the current development workspace. Some local files may not be included in the GitHub repository.
+`visentra_virtual_corridor_events.py` explores the use of a configurable image-space corridor to analyze tracked vehicle positions.
 
-Path	Purpose
-visentra.py	Main vehicle detection, tracking, and lane perception pipeline.
-visentra_live_accurate_low_latency.py	Live-processing experiment.
-visentra_live_optimized.py	Optimized live-processing experiment.
-visentra_virtual_corridor_events.py	Virtual-corridor and event experiments.
-MonoPilot/	Monocular depth and distance-estimation workstream.
-Depth-Anything-V2/	Depth Anything V2 source and development files, if present.
-CondLaneNet/	CondLaneNet source and configuration, if present.
-models/	Local model checkpoints and exported models, if present.
-test_images/	Test images and videos, if present.
-inference_results/	Generated inference results, if present.
-outputs/	Experimental output files, if present.
-diagnose_*.py	Diagnostic scripts.
-inspect_*.py	Model and output inspection scripts.
-benchmark_*.py	Performance benchmarking experiments.
-depth_calibration_config.json	Local distance-calibration configuration, if present.
-distance_calibration_rfdetr.json	Experimental calibration configuration, if present.
-A file being present locally does not necessarily mean it is tracked by Git.
+### Intended experiments
 
-Large model weights, test media, generated output directories, and virtual environments may be omitted from version control. A fresh clone may require additional model files, dependency installation, and path configuration.
+- Determine whether a tracked vehicle appears left, right, or near the center of the camera view.
+- Investigate whether the vehicle appears inside or near a configured corridor.
+- Analyze observations over time using track identities.
+- Experiment with timed events and multiple-vehicle scenarios.
+- Investigate the effects of configurable distance thresholds when a valid distance estimate is available.
 
-14. Reproducing the Distance Tests
-The four reference images used in the latest recorded test are:
+### Limitations
 
+Image-space position does not directly establish a vehicle's physical position relative to the host vehicle. A virtual corridor is not a calibrated three-dimensional safety zone.
+
+Relative speed and collision risk cannot be established reliably from a single image. Tracking and trajectory forecasts alone do not establish those quantities either. Camera motion, calibration, missing observations, ID switches, and model errors must be considered.
+
+All corridor and event behavior remains experimental.
+
+## 13. HiVT and Other Candidate Models
+
+HiVT has been explored in a separate experimental setup, including a synthetic smoke test. It is **not confirmed as integrated into the main VISENTRA pipeline**.
+
+HiVT is a trajectory-prediction approach that can be evaluated as an alternative to the current Kalman-based predictor. A successful import or synthetic test does not establish successful integration with the real camera pipeline or accurate predictions on road video.
+
+MobileNetV3 and DeepSORT remain candidate approaches rather than confirmed active components of the main pipeline.
+
+- **HiVT:** Candidate for trajectory-prediction evaluation.
+- **DeepSORT:** Candidate alternative to ByteTrack, not an additional tracker running alongside it.
+- **MobileNetV3:** Candidate for secondary classification or feature extraction, subject to evidence that it adds value beyond RF-DETR.
+
+Any candidate should be compared against the current implementation using the same or equivalent data, documented metrics, and reproducible configurations before it is adopted.
+
+## 14. Repository Structure
+
+The following paths describe principal files and folders in the development workspace. Not all local files are necessarily tracked by Git.
+
+| Path | Purpose |
+|---|---|
+| `visentra.py` | Main detection, tracking, lane, and orchestration pipeline |
+| `visentra_live_accurate_low_latency.py` | Live-processing experiment |
+| `visentra_live_optimized.py` | Live-processing optimization experiment |
+| `visentra_virtual_corridor_events.py` | Corridor and event-processing experiments |
+| `visentra_trajectory_predictor.py` | Kalman-based trajectory predictor |
+| `evaluate_visentra_trajectories.py` | Trajectory evaluation utility, if present |
+| `MonoPilot/` | Monocular depth and distance experiments |
+| `Depth-Anything-V2/` | Depth Anything V2 source and experiments, if present |
+| `CondLaneNet/` | Lane-model source and configuration, if present |
+| `models/` | Local model checkpoints and exported models, if present |
+| `test_images/` | Test images, if present |
+| `test_videos/` | Recorded-video inputs, if present |
+| `metric3d_test/` | Metric3D test outputs, if present |
+| `research_models/` | Experimental model files, if present |
+| `diagnose_*.py` | Diagnostic scripts |
+| `benchmark_*.py` | Benchmarking experiments |
+
+Large model weights, test media, generated results, backups, and virtual environments may be omitted from version control. A fresh clone may require separate model downloads, dependency installation, and path configuration.
+
+## 15. Reproducing the Distance and Trajectory Experiments
+
+The four reference images used in the documented distance test are:
+
+```text
 test_images/5m.png
 test_images/10m.png
 test_images/15m.png
 test_images/20m.png
-The exact test command depends on the current MonoPilot configuration and runner options. Use the current MonoPilot runner's help output and configuration to select the image directory, outdoor settings, and output directory.
+```
 
-A reproducible test should record:
+Use the current runner's help output and configuration to identify supported input and output options. Do not assume that every experimental script accepts the same arguments.
 
-The measured camera-to-target reference distance.
-The selected vehicle detection.
-The predicted depth or distance.
-The absolute error.
-The model and calibration configuration.
-The inference runtime.
-The output image and diagnostic log.
-Repeat the tests across more distances, vehicles, lighting conditions, and camera angles. Preserve the outputs so that changes to calibration or inference code can be compared fairly.
+For reproducible distance tests, record:
 
-15. Known Limitations
-VISENTRA is a research prototype. The main limitations include:
+- Reference camera-to-target distance.
+- Selected vehicle detection and image region.
+- Predicted depth or distance.
+- Absolute error.
+- Model and calibration configuration.
+- Inference runtime and test conditions.
 
-Distance accuracy: The four-image test set is too small to establish general accuracy.
-CPU throughput: Recorded depth-testing performance is substantially below the desired real-time target.
-Camera calibration: Field of view, focal length, mounting height, and pitch affect geometric estimates.
-Lane detection: Lane markings can be faded, obscured, missing, or confused with road edges and shadows.
-Vehicle detection: Detection may fail under occlusion, low light, glare, unusual viewpoints, or motion blur.
-Tracking stability: ByteTrack identities can be affected by missed detections, ID switches, occlusion, and camera movement; temporal consistency requires further evaluation.
-Motion estimation: Image displacement alone — whether from raw detections or tracked identities — does not establish reliable relative speed or collision risk.
-Generalization: Results on a few test images do not demonstrate robustness across real roads and weather.
-Hardware variation: Performance depends on the CPU, camera source, resolution, model, and software configuration.
-16. Development Roadmap
-Phase 1 — Vehicle and Lane Perception
-Verify vehicle detections on repeatable road images and recorded videos.
-Validate lane curves and their visualization.
-Check how both outputs align in the same frame.
-Document model failures and inference time.
-Phase 2 — Distance Estimation and Calibration
-Calibrate the actual camera.
-Expand known-distance tests.
-Evaluate depth and range errors separately.
-Improve target selection and geometric interpretation.
-Compare calibration changes on the same fixed test set.
-Testing goals: distance error (mean/median absolute error), error by reference distance, calibration repeatability.
-Phase 3 — Tracking and Temporal Consistency
-Evaluate ByteTrack performance on recorded clips with known vehicle counts.
-Measure ID-switch frequency and track-loss/recovery behavior under occlusion and camera movement.
-Compare tracking behavior across different detection confidence thresholds.
-Testing goals: tracking stability (ID-switch rate, track fragmentation), false detections feeding into tracks, end-to-end latency added by tracking.
-Phase 4 — Live-Video Performance
-Stabilize the camera input.
-Measure capture FPS and end-to-end latency, broken down by pipeline stage.
-Reduce unnecessary frame copies and repeated processing where appropriate.
-Compare the live-processing variants under identical conditions.
-Testing goals: inference FPS per model, end-to-end FPS, frame-to-display latency, dropped/skipped frames, CPU utilization.
-Phase 5 — Virtual-Corridor and Event Evaluation
-Evaluate tracked-vehicle corridor classification across recorded clips.
-Test left, center, and right classification accuracy.
-Measure event stability and false-trigger frequency.
-Test multiple-vehicle cases and time-based event logic.
-Keep event decisions separate from any safety-critical vehicle controls.
-Testing goals: false-trigger rate, event timing accuracy, stability under multiple simultaneous vehicles.
-Phase 6 — Proposed Model Evaluation and Broader Validation
-Evaluate MobileNetV3 as a candidate for secondary classification/feature extraction, against the existing detector on the same test data.
-Evaluate DeepSORT as a candidate alternative to ByteTrack, against the same tracking test set and metrics.
-Test more road types, vehicles, distances, and lighting conditions.
-Document failures as well as successful examples.
-Publish reproducible configurations and benchmark results.
-Reassess the project's feasibility against the intended latency and accuracy requirements.
-Testing goals: head-to-head accuracy/latency comparisons for each proposed model, false detections, distance error, inference FPS, end-to-end latency, CPU utilization.
-17. Safety Notice
+For trajectory experiments, record:
+
+- Video identity and evaluated frame range.
+- Track IDs and observation timestamps.
+- Prediction horizon and model configuration.
+- Predicted versus observed future positions.
+- Number of valid predictions.
+- Mean and median prediction errors.
+- Missing observations and tracking interruptions.
+
+Use the same evaluation clips and settings when comparing predictor changes.
+
+## 16. Known Limitations
+
+VISENTRA is a research prototype with the following limitations:
+
+- **Distance accuracy:** The documented four-image test is too small to establish general accuracy.
+- **CPU throughput:** Recorded CPU inference is substantially below the long-term real-time target.
+- **Camera calibration:** Field of view, focal length, mounting height, and camera pitch affect geometric estimates.
+- **Lane detection:** Markings may be faded, obscured, or confused with shadows and road edges.
+- **Vehicle detection:** Occlusion, glare, low light, and motion blur may cause detection failures.
+- **Tracking stability:** Missed detections, identity switches, and long gaps can disrupt track histories.
+- **Trajectory prediction:** Forecasts depend on observation quality and may not capture sudden maneuvers.
+- **Motion estimation:** Image displacement is not automatically equivalent to physical relative speed.
+- **Generalization:** A few images or videos cannot demonstrate robustness across roads and weather.
+- **Hardware variation:** Performance varies with the CPU, camera source, resolution, model, and software configuration.
+- **Integration status:** Experimental scripts and separately installed models are not necessarily part of the active end-to-end pipeline.
+
+## 17. Development Roadmap
+
+### Phase 1 — Vehicle and Lane Perception
+- Validate vehicle detections on repeatable road images and recorded videos.
+- Evaluate lane-curve placement and visualization.
+- Check the alignment of vehicle and lane outputs.
+- Record failure cases and inference times.
+
+### Phase 2 — Distance Estimation and Calibration
+- Calibrate the actual camera.
+- Expand known-distance tests.
+- Evaluate depth and range errors separately.
+- Improve target selection and geometric interpretation.
+- Compare calibration changes using a fixed test set.
+
+### Phase 3 — Tracking and Temporal Consistency
+- Evaluate ByteTrack on recorded clips.
+- Measure track fragmentation and identity switches.
+- Examine track loss and recovery after occlusion.
+- Check the behavior of the frame-order safeguard.
+- Measure tracking latency and temporal gaps.
+
+### Phase 4 — Trajectory Prediction
+- Evaluate the Kalman-based predictor on recorded videos.
+- Measure prediction error at several forecast horizons.
+- Check sensitivity to missing observations and timestamp gaps.
+- Compare HiVT only after establishing a reproducible evaluation setup.
+- Keep experimental predictions separate from safety-critical decisions.
+
+### Phase 5 — Live-Video Performance
+- Stabilize camera input.
+- Measure per-model and end-to-end latency.
+- Investigate frame copies, queues, and unnecessary repeated processing.
+- Compare live variants under identical conditions.
+- Record dropped and skipped frames.
+
+### Phase 6 — Virtual-Corridor and Event Evaluation
+- Evaluate left, center, and right classification.
+- Measure corridor-classification errors.
+- Test event stability and false triggers.
+- Evaluate multiple-vehicle scenarios.
+- Keep experimental alerts separate from vehicle controls.
+
+### Phase 7 — Broader Model and Road Validation
+- Evaluate candidate models against the active pipeline.
+- Test additional vehicles, roads, distances, and lighting conditions.
+- Publish reproducible configurations and benchmark results.
+- Document failures as well as successful examples.
+- Reassess feasibility against the intended accuracy and latency requirements.
+
+## 18. Safety Notice
+
 VISENTRA is not a certified advanced driver-assistance system and must not be relied upon for safety-critical driving or reversing decisions.
 
-The current distance estimates, tracking behavior, and virtual-corridor logic are experimental. A visually plausible bounding box, track, lane curve, or distance value does not guarantee that it is correct.
+Detection boxes, track identities, lane curves, distance estimates, and predicted trajectories may be incorrect. A visually plausible result does not guarantee accuracy.
 
-Do not use the system as the sole basis for activating vehicle indicators, deciding whether a maneuver is safe, or controlling vehicle movement. All experiments involving a vehicle should be performed in controlled conditions without placing people or property at risk.
+Do not use VISENTRA as the sole basis for deciding whether a maneuver is safe, activating vehicle indicators, or controlling vehicle movement. Conduct experiments in controlled conditions without exposing people or property to risk.
 
-18. Project Summary
-VISENTRA explores camera-based vehicle detection, multi-frame vehicle tracking, lane perception, monocular depth estimation, and virtual-corridor event logic.
+## 19. Project Summary
 
-The project combines RF-DETR, ByteTrack, and CurveLaneS / CondLaneNet for vehicle, tracking, and lane perception, while MonoPilot investigates approximate distance estimation using vehicle detection, metric depth prediction, and geometric analysis as a separate experimental workstream. MobileNetV3 and DeepSORT are proposed candidates for future evaluation, not confirmed integrated components.
+VISENTRA explores camera-based vehicle detection, multi-frame tracking, lane perception, monocular depth estimation, trajectory prediction, and virtual-corridor event logic.
 
-The latest recorded four-image distance experiment achieved a mean absolute error of approximately 2.38 m, while the recorded outdoor CPU depth tests ran at approximately 1.3–1.5 FPS. These measurements establish a starting point for further development, not a guarantee of general accuracy or real-time performance.
+The principal components of the main pipeline are:
 
-The next priorities are broader distance validation, camera calibration, stable live-video processing, tracking stability evaluation, and systematic evaluation of temporal, corridor, and proposed-model behavior.
+1. **RF-DETR** — vehicle detection.
+2. **ByteTrack** — multi-frame vehicle tracking.
+3. **CurveLaneS / CondLaneNet** — lane detection.
+4. **Metric3D** — experimental monocular depth estimation.
+5. **Kalman-based trajectory predictor** — experimental short-term motion forecasting.
 
+The MonoPilot depth experiments and HiVT evaluation are separate workstreams and should be described according to their actual integration status.
 
-Claude finished the response
+The latest documented four-image distance experiment produced an MAE of approximately **2.38 m**. Recorded CPU tests have also shown substantial inference latency. These results provide a baseline for continued experimentation; they do not establish general distance accuracy, reliable trajectory prediction, or real-time safety performance.
+
+The next priorities are broader distance validation, camera calibration, tracking stability, trajectory-prediction evaluation, and systematic measurement of end-to-end latency.
+
