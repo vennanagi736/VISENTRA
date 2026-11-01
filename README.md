@@ -1,17 +1,20 @@
-
-
 # VISENTRA
+## Intelligent Vehicle Proximity Warning System
 ## Vision-Based Vehicle, Lane, Distance, and Trajectory-Awareness Research Pipeline
 
 VISENTRA is a computer vision research project exploring how a road-facing camera can be used to detect vehicles, track them across frames, estimate lane boundaries, investigate approximate vehicle distances, and predict short-term vehicle motion.
 
 The project combines **RF-DETR** for vehicle detection, **ByteTrack** for multi-frame tracking, **CurveLaneS / CondLaneNet** for lane detection, **Metric3D** for experimental monocular depth estimation, and a **Kalman-filter-based trajectory predictor** for short-term motion forecasting.
 
-Additional depth-estimation and trajectory-prediction approaches are investigated separately. These include the MonoPilot depth-processing workstream and HiVT experiments, which must not be confused with components confirmed as integrated into the main pipeline.
+The project also investigates **HiVT (Hierarchical Vector Transformer)** as an advanced trajectory-prediction approach. HiVT experiments use pretrained HiVT-64 and HiVT-128 configurations and investigate converting camera-based vehicle tracking observations into trajectory-model inputs.
+
+VISENTRA additionally includes a structured **86 Settings Configuration**, comprising 9 ESP32 GPIO assignments and 77 software configuration settings. These settings organize hardware connections, operating modes, sensor parameters, LED and buzzer behavior, timing, and advanced system controls.
+
+Additional depth-estimation and trajectory-prediction approaches are investigated separately. These include the MonoPilot depth-processing workstream and HiVT experiments, whose integration and validation status must be distinguished from the confirmed operation of the main perception components.
 
 VISENTRA investigates camera-only road awareness using a phone camera or compatible webcam, without requiring radar or lidar as core inputs.
 
-**Project status:** Research and prototyping. Detection, tracking, lane estimation, depth estimation, trajectory prediction, and virtual-corridor logic have different levels of validation. The complete system is not safety-certified.
+**Project status:** Research and prototyping. Detection, tracking, lane estimation, depth estimation, trajectory prediction, virtual-corridor logic, and hardware configuration have different levels of validation. The complete system is not safety-certified.
 
 ---
 
@@ -28,8 +31,9 @@ The main objectives are:
 - **Lane detection:** Estimate lane curves and visualize the apparent road corridor.
 - **Distance estimation:** Investigate approximate vehicle range using monocular depth estimation.
 - **Relative-position analysis:** Examine whether vehicles appear to the left, right, or center of the image.
-- **Trajectory prediction:** Experiment with forecasting short-term vehicle motion from tracked observations.
+- **Trajectory prediction:** Experiment with forecasting short-term vehicle motion using Kalman-based prediction and HiVT.
 - **Virtual corridor:** Investigate vehicle positions relative to a configurable image-space region.
+- **Hardware configuration:** Organize ESP32 GPIO assignments, sensors, indicators, operating modes, and system behavior through the 86 Settings Configuration.
 - **Event logic:** Explore timed responses to persistent vehicle observations and multiple-object scenarios.
 - **Performance evaluation:** Measure inference speed, processing throughput, skipped frames, and latency.
 
@@ -37,7 +41,7 @@ The long-term objective is to develop a low-cost, camera-based road-awareness pr
 
 ## 2. System Architecture
 
-VISENTRA contains related but distinct perception and experimentation workstreams.
+VISENTRA contains related but distinct perception, prediction, hardware-configuration, and experimentation workstreams.
 
 ### A. Main vehicle and lane perception pipeline
 
@@ -66,7 +70,7 @@ VISENTRA contains related but distinct perception and experimentation workstream
               |          Lane Curves       |
               v               |            |
        Trajectory Predictor   |            |
-       (Kalman-based)         |            |
+        (Kalman / HiVT)       |            |
               |               |            |
               +---------------+------------+
                               |
@@ -113,16 +117,62 @@ The main pipeline uses Metric3D for experimental depth estimation. MonoPilot als
                Timestamped Observations
                          |
                          v
-            Kalman-Based State Estimation
+                 Camera-Track Adapter
                          |
-                         v
-                Short-Term Forecast
-                         |
-                         v
-              Prediction Error Evaluation
+              +----------+----------+
+              |                     |
+              v                     v
+        Kalman Predictor       HiVT Adapter
+              |                     |
+              v                     v
+       Short-Term Forecast    HiVT Worker
+                                    |
+                                    v
+                             HiVT-64 / HiVT-128
+                                    |
+                                    v
+                             Six Prediction Modes
+                                    |
+                                    v
+                              Future Trajectories
+                                    |
+                                    v
+                           VISENTRA Visualization
 ```
 
-Trajectory prediction uses past observations to estimate possible future image-space positions. It does not independently establish actual road-relative velocity, collision risk, or a safe maneuver.
+The Kalman-based predictor and HiVT have different architectures and input requirements.
+
+HiVT requires trajectory and map-related tensor inputs. VISENTRA investigates converting camera-based tracked observations into a compatible representation.
+
+The predictions are experimental and must not automatically be interpreted as physical vehicle motion, collision probability, or road-relative velocity.
+
+### D. Hardware and configuration workstream
+
+```text
+                  VISENTRA Configuration
+                            |
+                            v
+                    86 Settings Design
+                            |
+                 +----------+----------+
+                 |                     |
+                 v                     v
+             9 GPIO Pins         77 Software Settings
+                 |                     |
+                 v                     v
+          ESP32 Connections     Operating Parameters
+                 |                     |
+                 +----------+----------+
+                            |
+                            v
+                  Configurable System
+                      Behavior
+                            |
+                            v
+                   Hardware Testing
+```
+
+The 86 Settings Configuration provides a structured way to organize hardware and software parameters. Individual settings must be verified against the implemented source code and hardware behavior.
 
 Not every component runs simultaneously, and the presence of a model or script in the repository does not establish successful integration.
 
@@ -200,7 +250,7 @@ Lane estimates can be affected by faded markings, shadows, glare, road curvature
 
 ## 6. Trajectory Prediction — Kalman-Based Predictor
 
-VISENTRA includes the experimental trajectory predictor implemented in:
+VISENTRA includes an experimental trajectory predictor implemented in:
 
 `visentra_trajectory_predictor.py`
 
@@ -242,7 +292,348 @@ Useful measurements include:
 
 Preliminary experiments are not a substitute for a larger, repeatable evaluation set.
 
-## 7. Separate Python Environments
+## 7. HiVT — Hierarchical Vector Transformer Trajectory Prediction
+
+HiVT (Hierarchical Vector Transformer) is an advanced trajectory-prediction approach investigated for VISENTRA.
+
+Unlike a basic motion extrapolation method, HiVT uses a learned trajectory-prediction architecture to model historical agent movement and estimate multiple possible future trajectories.
+
+The purpose of introducing HiVT is to investigate whether a pretrained trajectory-prediction model can provide more expressive future-motion forecasts than a simple constant-acceleration predictor.
+
+### 7.1 HiVT model configurations
+
+VISENTRA's HiVT experiments investigate two pretrained model configurations:
+
+- **HiVT-64**
+- **HiVT-128**
+
+The configurations are evaluated as alternative model sizes within the same trajectory-prediction architecture.
+
+The experiments use pretrained checkpoints and associated configuration information, including `hparams.yaml` files.
+
+The models are maintained separately from the RF-DETR, lane-detection, and Metric3D environments because HiVT has its own dependency and input requirements.
+
+### 7.2 Proposed VISENTRA integration architecture
+
+The camera-based trajectory-prediction workflow is:
+
+```text
+             Vivo V27 Rear Camera / Webcam
+                         |
+                         v
+                       RF-DETR
+                  Vehicle Detection
+                         |
+                         v
+                      ByteTrack
+                 Persistent Track IDs
+                         |
+                         v
+               Timestamped Track History
+                         |
+                         v
+                 VISENTRA HiVT Adapter
+                         |
+                         v
+               Camera-to-Trajectory
+                    Conversion
+                         |
+                         v
+                   HiVT Worker
+                         |
+                +--------+--------+
+                |                 |
+                v                 v
+             HiVT-64           HiVT-128
+                |                 |
+                +--------+--------+
+                         |
+                         v
+                 Six Future Modes
+                         |
+                         v
+                Predicted Trajectories
+                         |
+                         v
+                VISENTRA Preview
+```
+
+RF-DETR and ByteTrack provide the vehicle detections and temporal track observations. The adapter converts the camera-based tracking information into the tensor representation required by HiVT.
+
+The worker provides an isolated execution process for loading the pretrained model and processing prediction requests.
+
+### 7.3 HiVT input preparation
+
+HiVT expects structured trajectory and map-related inputs rather than raw vehicle bounding boxes.
+
+The original model input structure includes:
+
+- `x` — historical agent trajectory information.
+- `positions` — agent positions.
+- `edge_index` — relationships between agents.
+- `padding_mask` — valid and padded observation information.
+- `bos_mask` — beginning-of-sequence information.
+- `rotate_angles` — trajectory orientation information.
+- Lane-related tensors and indices.
+- Lane vectors and associated geometric information.
+
+VISENTRA's adapter investigates converting ByteTrack observations into these model inputs.
+
+The camera-to-trajectory conversion includes:
+
+1. Collecting observations associated with persistent vehicle track IDs.
+2. Maintaining timestamped vehicle history.
+3. Extracting image-space positions from tracked vehicle detections.
+4. Preparing the required historical trajectory length.
+5. Converting the observations into the model's expected tensor layout.
+6. Preparing lane-related inputs required by the model.
+7. Sending the prepared inputs to the HiVT worker.
+8. Receiving future trajectory predictions for visualization.
+
+The investigated configuration uses **20 historical steps and predicts 30 future steps**, with **six possible prediction modes**.
+
+These values describe the experimental model configuration and prediction interface. They do not establish that every real-camera prediction is accurate.
+
+### 7.4 HiVT worker architecture
+
+The experimental worker architecture separates model execution from the main perception pipeline.
+
+The intended worker responsibilities include:
+
+- Loading the pretrained HiVT checkpoint.
+- Initializing the model and its dependencies.
+- Receiving prediction requests.
+- Preparing and validating tensor inputs.
+- Running model inference.
+- Returning predicted trajectories.
+- Reporting inference timing.
+- Handling errors and invalid requests.
+- Supporting clean worker shutdown.
+
+The worker uses a persistent process and a newline-delimited JSON communication protocol in the experimental implementation.
+
+This architecture is intended to prevent trajectory-prediction dependencies from unnecessarily interfering with the main detection and tracking environments.
+
+### 7.5 HiVT project files
+
+The experimental integration workstream includes:
+
+| File or directory | Purpose |
+|---|---|
+| `Claude/visentra.py` | Experimental main application integration |
+| `Claude/visentra_hivt_worker.py` | Isolated HiVT model execution |
+| `Claude/visentra_hivt_adapter.py` | Camera-track conversion and model-input preparation |
+| `research_models/HiVT/` | HiVT source and model-related resources |
+| HiVT-64 checkpoint | Pretrained trajectory-prediction configuration |
+| HiVT-128 checkpoint | Alternative pretrained trajectory-prediction configuration |
+| `hparams.yaml` | Associated model configuration information |
+
+The root and Claude implementations have been treated as separate integration candidates. Their worker and adapter behavior must be compared before obsolete prototypes are replaced or merged.
+
+The exact paths may differ between local development checkouts.
+
+### 7.6 HiVT prediction output
+
+The experimental HiVT configuration produces six possible future trajectory modes.
+
+These modes represent alternative predicted future paths rather than six guaranteed future movements.
+
+The intended visualization includes:
+
+- Historical vehicle trajectory.
+- Current tracked vehicle position.
+- Predicted future trajectory.
+- Multiple prediction modes.
+- Prediction horizon.
+- Model inference information.
+
+The objective is to display the predicted paths in the VISENTRA preview alongside the detected and tracked vehicles.
+
+The model's prediction output should remain associated with the correct track ID and timestamp. Asynchronous results must be checked for stale or outdated predictions before visualization.
+
+### 7.7 Experimental testing and validation status
+
+Initial HiVT experiments have investigated:
+
+- Loading the pretrained model.
+- Checking checkpoint and configuration compatibility.
+- Preparing synthetic trajectory histories.
+- Validating tensor dimensions.
+- Checking coordinate transformations.
+- Testing the six-mode prediction output.
+- Verifying that generated outputs are finite and executable.
+- Investigating worker communication and process handling.
+
+Synthetic tests provide evidence of structural execution, not real-road prediction accuracy.
+
+The adapter's current camera-input approach has important limitations:
+
+- Camera detections are image-space observations, not calibrated world coordinates.
+- Image-space positions do not directly establish physical vehicle velocity.
+- The experimental adapter has used structurally valid empty lane tensors, rather than a fully verified camera-derived lane-map representation.
+- Required metadata and complete original model-input compatibility still require verification.
+- The current coordinate representation does not establish a reliable mapping to road-relative physical distances.
+
+Consequently, successful synthetic execution must not be presented as proof of accurate real-world trajectory forecasting.
+
+### 7.8 HiVT and Kalman predictor relationship
+
+The existing Kalman predictor remains a separate baseline.
+
+HiVT is investigated as an additional learned prediction approach rather than being treated as an automatic replacement for the Kalman implementation.
+
+The two approaches should be evaluated using identical recorded videos and comparable track histories wherever possible.
+
+Comparison criteria include:
+
+- Prediction accuracy.
+- Mean and median displacement error.
+- Performance at different prediction horizons.
+- Prediction stability.
+- Sensitivity to missing track observations.
+- Inference latency.
+- CPU resource usage.
+- Prediction availability for individual tracked vehicles.
+
+HiVT should only be considered a validated replacement or active production component after successful real-video testing and reproducible performance evaluation.
+
+## 8. VISENTRA 86 Settings Configuration
+
+VISENTRA includes a structured **86 Settings Configuration** designed to organize hardware connections and software behavior.
+
+The configuration contains:
+
+- **9 ESP32 GPIO pin assignments.**
+- **77 software configuration settings.**
+
+Its purpose is to provide a structured configuration system for sensor parameters, operating modes, indicators, timing, and advanced system behavior.
+
+### 8.1 Configuration breakdown
+
+| Configuration category | Number of settings |
+|---|---:|
+| ESP32 GPIO assignments | 9 |
+| Feature enable/disable | 13 |
+| Distance / sensor | 14 |
+| Operating-mode controls | 3 |
+| LED configuration | 11 |
+| Buzzer configuration | 10 |
+| LDR configuration | 5 |
+| System timing | 9 |
+| Advanced settings | 7 |
+| Ultrasonic scheduling | 1 |
+| Mode multipliers | 4 |
+| **Total configuration entries** | **86** |
+
+The 77 software settings are separate from the nine hardware GPIO assignments.
+
+### 8.2 Hardware GPIO configuration
+
+The GPIO configuration organizes the ESP32 hardware connections used in the prototype.
+
+The current recorded prototype pin assignments include:
+
+| Hardware component | ESP32 GPIO |
+|---|---:|
+| Left LED | 25 |
+| Right LED | 26 |
+| Switch | 14 |
+| LDR | 15 |
+| Left ultrasonic TRIG | 5 |
+| Left ultrasonic ECHO | 18 |
+| Right ultrasonic TRIG | 32 |
+| Right ultrasonic ECHO | 33 |
+
+The configuration design contains nine GPIO assignment entries. The recorded prototype connections above document the known pin mapping; the remaining assignment must be verified against the actual hardware configuration before documenting it as a specific connection.
+
+### 8.3 Software configuration categories
+
+The 77 software settings are organized into ten categories.
+
+**Feature enable/disable — 13 settings**
+
+Organizes feature-level controls to enable or disable supported functionality.
+
+**Distance and sensor — 14 settings**
+
+Organizes distance thresholds and sensor-related parameters.
+
+**Operating-mode controls — 3 settings**
+
+Provides controls for selecting and managing operating modes.
+
+**LED configuration — 11 settings**
+
+Organizes LED behavior, brightness, and indicator-related parameters.
+
+**Buzzer configuration — 10 settings**
+
+Organizes buzzer behavior and associated alert parameters.
+
+**LDR configuration — 5 settings**
+
+Organizes light-dependent resistor configuration and lighting-related behavior.
+
+**System timing — 9 settings**
+
+Organizes timing values used by system operations and event processing.
+
+**Advanced settings — 7 settings**
+
+Provides additional configurable parameters for advanced behavior.
+
+**Ultrasonic scheduling — 1 setting**
+
+Organizes the ultrasonic scheduling control.
+
+**Mode multipliers — 4 settings**
+
+Provides one multiplier for each operating mode.
+
+### 8.4 Operating modes and multipliers
+
+The configuration design includes four operating profiles.
+
+| Operating mode | Multiplier |
+|---|---:|
+| Parking | 0.75× |
+| Daily Road | 1.00× |
+| Traffic | 0.80× |
+| Long Drive | 1.20× |
+
+These multipliers are configuration values for the respective operating modes. Their actual effect depends on the parameters to which they are applied in the implementation.
+
+### 8.5 Configuration objectives
+
+The 86 Settings Configuration is intended to:
+
+- Organize hardware and software parameters centrally.
+- Provide configurable sensor thresholds.
+- Support multiple operating profiles.
+- Control LED and buzzer behavior.
+- Configure lighting-related behavior.
+- Organize system timing and scheduling.
+- Provide feature-level enable/disable controls.
+- Make future feature expansion easier.
+- Reduce unnecessary changes to core application logic when adjusting supported parameters.
+
+### 8.6 Configuration validation
+
+The 86-entry configuration represents the designed configuration structure.
+
+Validation should confirm:
+
+- All nine GPIO assignments match the hardware.
+- All 77 software settings have defined meanings.
+- Each setting has an appropriate default and valid range.
+- Operating-mode multipliers affect the intended parameters.
+- Changes are applied consistently.
+- Hardware behavior matches the configured values.
+- Unsupported or conflicting combinations are handled safely.
+
+The existence of a configuration entry does not automatically establish that its associated functionality has been implemented or validated.
+
+## 9. Separate Python Environments
 
 The models have different dependency requirements, so VISENTRA uses separate Python environments rather than forcing all dependencies into one installation.
 
@@ -252,12 +643,14 @@ The models have different dependency requirements, so VISENTRA uses separate Pyt
 | ByteTrack | Main pipeline environment | Vehicle tracking |
 | CurveLaneS / CondLaneNet | `environments/condlanenet_env/` | Lane detection |
 | Metric3D | `MonoPilot/.venv/` | Experimental depth estimation |
-| Trajectory predictor | Main pipeline code | Short-term motion forecasting |
-| HiVT experiments | Separate experimental setup | Evaluation of an alternative trajectory-prediction approach |
+| Kalman predictor | Main pipeline code | Short-term motion forecasting |
+| HiVT | `research_models/HiVT/` and associated experimental environment | Learned trajectory prediction |
 
-These paths describe the current Windows development workspace. Other computers may require different paths, dependencies, or configuration.
+The experimental HiVT worker uses an isolated execution environment to accommodate its model dependencies.
 
-## 8. MonoPilot — Monocular Depth and Distance Estimation
+These paths describe the Windows development workspace. Other computers may require different paths, dependencies, or configuration.
+
+## 10. MonoPilot — Monocular Depth and Distance Estimation
 
 MonoPilot is a separate experimental workstream for monocular depth and distance estimation.
 
@@ -282,7 +675,7 @@ A detector identifies an object and its approximate image region. A depth model 
 
 However, camera-axis depth is not necessarily the same as the straight-line distance from the camera to a target. Bounding-box placement, selected pixels, occlusion, camera calibration, and model error can all affect the estimate.
 
-## 9. Known-Distance Validation
+## 11. Known-Distance Validation
 
 A recorded MonoPilot experiment used four still images with approximate reference distances.
 
@@ -319,7 +712,7 @@ This is a small diagnostic set, not a statistically representative benchmark. It
 
 Further work should include more distances, vehicles, camera positions, lighting conditions, and repeated measurements. Calibration settings should remain consistent within a test series unless a change is documented.
 
-## 10. CPU Performance and Recorded-Video Testing
+## 12. CPU Performance and Recorded-Video Testing
 
 The current development machine uses Windows 11 and an Intel Core i5-1335U CPU without a dedicated GPU.
 
@@ -350,14 +743,15 @@ Performance reports should distinguish:
 - Tracking processing time.
 - Lane-detection inference time and FPS.
 - Depth-estimation inference time and FPS.
-- Trajectory-prediction processing time.
+- Kalman prediction processing time.
+- HiVT inference time and FPS.
 - End-to-end throughput.
 - Frame-to-display latency.
 - Dropped, skipped, and out-of-order frames.
 
 A window that displays frames successfully does not establish that all models are processing those frames at the same rate.
 
-## 11. Live-Processing Variants
+## 13. Live-Processing Variants
 
 The repository contains experimental implementations for investigating different processing approaches.
 
@@ -368,13 +762,18 @@ The repository contains experimental implementations for investigating different
 | `visentra_live_optimized.py` | Experimental live-processing optimization |
 | `visentra_virtual_corridor_events.py` | Virtual-corridor and event-processing experiments |
 | `visentra_trajectory_predictor.py` | Kalman-based trajectory prediction |
+| `Claude/visentra.py` | Experimental HiVT application integration |
+| `Claude/visentra_hivt_worker.py` | Isolated HiVT execution |
+| `Claude/visentra_hivt_adapter.py` | Camera-track to HiVT input conversion |
 | `evaluate_visentra_trajectories.py` | Experimental trajectory-evaluation utility, if present in the checkout |
 
 These variants should be tested independently. Their accuracy and performance must not be assumed equivalent.
 
-The intended live workflow is to acquire camera frames, run detection, track vehicles, estimate lane curves, process available depth outputs, update trajectory forecasts, and display the results. Camera connectivity and throughput depend on the device, resolution, and capture method.
+The intended live workflow is to acquire camera frames, run detection, track vehicles, estimate lane curves, process available depth outputs, update trajectory forecasts, and display the results.
 
-## 12. Virtual Corridor and Event Logic
+Camera connectivity and throughput depend on the device, resolution, and capture method.
+
+## 14. Virtual Corridor and Event Logic
 
 `visentra_virtual_corridor_events.py` explores the use of a configurable image-space corridor to analyze tracked vehicle positions.
 
@@ -394,21 +793,29 @@ Relative speed and collision risk cannot be established reliably from a single i
 
 All corridor and event behavior remains experimental.
 
-## 13. HiVT and Other Candidate Models
+## 15. Other Candidate Models and Approaches
 
-HiVT has been explored in a separate experimental setup, including a synthetic smoke test. It is **not confirmed as integrated into the main VISENTRA pipeline**.
+Additional models and approaches may be evaluated separately from the main pipeline.
 
-HiVT is a trajectory-prediction approach that can be evaluated as an alternative to the current Kalman-based predictor. A successful import or synthetic test does not establish successful integration with the real camera pipeline or accurate predictions on road video.
+### DeepSORT
 
-MobileNetV3 and DeepSORT remain candidate approaches rather than confirmed active components of the main pipeline.
+DeepSORT is a candidate alternative to ByteTrack.
 
-- **HiVT:** Candidate for trajectory-prediction evaluation.
-- **DeepSORT:** Candidate alternative to ByteTrack, not an additional tracker running alongside it.
-- **MobileNetV3:** Candidate for secondary classification or feature extraction, subject to evidence that it adds value beyond RF-DETR.
+It can be investigated for multi-object tracking performance, identity consistency, and behavior under occlusion.
+
+It should not be treated as an additional active tracker alongside ByteTrack unless a specific configuration explicitly runs both.
+
+### MobileNetV3
+
+MobileNetV3 is a candidate for secondary classification or feature-extraction experiments.
+
+Its usefulness should be evaluated against the existing RF-DETR pipeline before adoption.
+
+### Model evaluation requirements
 
 Any candidate should be compared against the current implementation using the same or equivalent data, documented metrics, and reproducible configurations before it is adopted.
 
-## 14. Repository Structure
+## 16. Repository Structure
 
 The following paths describe principal files and folders in the development workspace. Not all local files are necessarily tracked by Git.
 
@@ -419,7 +826,10 @@ The following paths describe principal files and folders in the development work
 | `visentra_live_optimized.py` | Live-processing optimization experiment |
 | `visentra_virtual_corridor_events.py` | Corridor and event-processing experiments |
 | `visentra_trajectory_predictor.py` | Kalman-based trajectory predictor |
-| `evaluate_visentra_trajectories.py` | Trajectory evaluation utility, if present |
+| `Claude/visentra.py` | Experimental HiVT integration application |
+| `Claude/visentra_hivt_worker.py` | HiVT model worker |
+| `Claude/visentra_hivt_adapter.py` | HiVT camera-track adapter |
+| `research_models/HiVT/` | HiVT source and model resources |
 | `MonoPilot/` | Monocular depth and distance experiments |
 | `Depth-Anything-V2/` | Depth Anything V2 source and experiments, if present |
 | `CondLaneNet/` | Lane-model source and configuration, if present |
@@ -427,13 +837,13 @@ The following paths describe principal files and folders in the development work
 | `test_images/` | Test images, if present |
 | `test_videos/` | Recorded-video inputs, if present |
 | `metric3d_test/` | Metric3D test outputs, if present |
-| `research_models/` | Experimental model files, if present |
+| `research_models/` | Experimental model files |
 | `diagnose_*.py` | Diagnostic scripts |
 | `benchmark_*.py` | Benchmarking experiments |
 
 Large model weights, test media, generated results, backups, and virtual environments may be omitted from version control. A fresh clone may require separate model downloads, dependency installation, and path configuration.
 
-## 15. Reproducing the Distance and Trajectory Experiments
+## 17. Reproducing the Distance and Trajectory Experiments
 
 The four reference images used in the documented distance test are:
 
@@ -446,6 +856,8 @@ test_images/20m.png
 
 Use the current runner's help output and configuration to identify supported input and output options. Do not assume that every experimental script accepts the same arguments.
 
+### Distance evaluation
+
 For reproducible distance tests, record:
 
 - Reference camera-to-target distance.
@@ -455,7 +867,9 @@ For reproducible distance tests, record:
 - Model and calibration configuration.
 - Inference runtime and test conditions.
 
-For trajectory experiments, record:
+### Kalman trajectory evaluation
+
+Record:
 
 - Video identity and evaluated frame range.
 - Track IDs and observation timestamps.
@@ -465,9 +879,27 @@ For trajectory experiments, record:
 - Mean and median prediction errors.
 - Missing observations and tracking interruptions.
 
+### HiVT evaluation
+
+Record:
+
+- HiVT configuration: HiVT-64 or HiVT-128.
+- Checkpoint and associated configuration.
+- Number of historical observations.
+- Number of predicted future steps.
+- Number of available prediction modes.
+- Camera-track conversion settings.
+- Input tensor dimensions and validation results.
+- Lane-related input preparation.
+- Prediction latency.
+- Predicted versus observed future positions.
+- Number of valid predictions.
+- Mean and median displacement errors.
+- Worker startup and execution behavior.
+
 Use the same evaluation clips and settings when comparing predictor changes.
 
-## 16. Known Limitations
+## 18. Known Limitations
 
 VISENTRA is a research prototype with the following limitations:
 
@@ -477,21 +909,28 @@ VISENTRA is a research prototype with the following limitations:
 - **Lane detection:** Markings may be faded, obscured, or confused with shadows and road edges.
 - **Vehicle detection:** Occlusion, glare, low light, and motion blur may cause detection failures.
 - **Tracking stability:** Missed detections, identity switches, and long gaps can disrupt track histories.
-- **Trajectory prediction:** Forecasts depend on observation quality and may not capture sudden maneuvers.
+- **Kalman prediction:** Forecasts depend on observation quality and may not capture sudden maneuvers.
+- **HiVT input compatibility:** Camera-based image-space tracks require appropriate conversion into the model's expected trajectory representation.
+- **HiVT map information:** Camera-derived lane and map inputs require further validation.
+- **HiVT coordinate limitations:** Current experimental image-plane predictions are not verified physical or world-coordinate trajectories.
+- **Trajectory accuracy:** Synthetic model execution does not establish real-road forecasting accuracy.
 - **Motion estimation:** Image displacement is not automatically equivalent to physical relative speed.
+- **Configuration validation:** The 86 Settings Configuration requires verification against actual hardware and software behavior.
 - **Generalization:** A few images or videos cannot demonstrate robustness across roads and weather.
 - **Hardware variation:** Performance varies with the CPU, camera source, resolution, model, and software configuration.
 - **Integration status:** Experimental scripts and separately installed models are not necessarily part of the active end-to-end pipeline.
 
-## 17. Development Roadmap
+## 19. Development Roadmap
 
 ### Phase 1 — Vehicle and Lane Perception
+
 - Validate vehicle detections on repeatable road images and recorded videos.
 - Evaluate lane-curve placement and visualization.
 - Check the alignment of vehicle and lane outputs.
 - Record failure cases and inference times.
 
 ### Phase 2 — Distance Estimation and Calibration
+
 - Calibrate the actual camera.
 - Expand known-distance tests.
 - Evaluate depth and range errors separately.
@@ -499,41 +938,65 @@ VISENTRA is a research prototype with the following limitations:
 - Compare calibration changes using a fixed test set.
 
 ### Phase 3 — Tracking and Temporal Consistency
+
 - Evaluate ByteTrack on recorded clips.
 - Measure track fragmentation and identity switches.
 - Examine track loss and recovery after occlusion.
 - Check the behavior of the frame-order safeguard.
 - Measure tracking latency and temporal gaps.
 
-### Phase 4 — Trajectory Prediction
+### Phase 4 — Kalman and HiVT Trajectory Prediction
+
 - Evaluate the Kalman-based predictor on recorded videos.
+- Validate HiVT-64 and HiVT-128 checkpoint loading.
+- Verify camera-track conversion.
+- Complete the model's required input and metadata preparation.
+- Validate lane-related inputs.
+- Evaluate the six prediction modes.
+- Integrate prediction visualization into the main preview.
 - Measure prediction error at several forecast horizons.
-- Check sensitivity to missing observations and timestamp gaps.
-- Compare HiVT only after establishing a reproducible evaluation setup.
+- Compare HiVT and Kalman predictions using identical clips.
+- Measure CPU inference latency and resource usage.
 - Keep experimental predictions separate from safety-critical decisions.
 
-### Phase 5 — Live-Video Performance
+### Phase 5 — 86 Settings Configuration
+
+- Verify all nine ESP32 GPIO assignments.
+- Define and validate all 77 software settings.
+- Check feature enable/disable behavior.
+- Validate distance and sensor parameters.
+- Test operating-mode selection.
+- Validate LED and buzzer configuration.
+- Test LDR-related settings.
+- Check system timing and ultrasonic scheduling.
+- Verify the four operating-mode multipliers.
+- Test configuration changes under controlled conditions.
+
+### Phase 6 — Live-Video Performance
+
 - Stabilize camera input.
 - Measure per-model and end-to-end latency.
 - Investigate frame copies, queues, and unnecessary repeated processing.
 - Compare live variants under identical conditions.
 - Record dropped and skipped frames.
 
-### Phase 6 — Virtual-Corridor and Event Evaluation
+### Phase 7 — Virtual-Corridor and Event Evaluation
+
 - Evaluate left, center, and right classification.
 - Measure corridor-classification errors.
 - Test event stability and false triggers.
 - Evaluate multiple-vehicle scenarios.
 - Keep experimental alerts separate from vehicle controls.
 
-### Phase 7 — Broader Model and Road Validation
+### Phase 8 — Broader Model and Road Validation
+
 - Evaluate candidate models against the active pipeline.
 - Test additional vehicles, roads, distances, and lighting conditions.
 - Publish reproducible configurations and benchmark results.
 - Document failures as well as successful examples.
 - Reassess feasibility against the intended accuracy and latency requirements.
 
-## 18. Safety Notice
+## 20. Safety Notice
 
 VISENTRA is not a certified advanced driver-assistance system and must not be relied upon for safety-critical driving or reversing decisions.
 
@@ -541,21 +1004,27 @@ Detection boxes, track identities, lane curves, distance estimates, and predicte
 
 Do not use VISENTRA as the sole basis for deciding whether a maneuver is safe, activating vehicle indicators, or controlling vehicle movement. Conduct experiments in controlled conditions without exposing people or property to risk.
 
-## 19. Project Summary
+## 21. Project Summary
 
-VISENTRA explores camera-based vehicle detection, multi-frame tracking, lane perception, monocular depth estimation, trajectory prediction, and virtual-corridor event logic.
+VISENTRA explores camera-based vehicle detection, multi-frame tracking, lane perception, monocular depth estimation, trajectory prediction, virtual-corridor event logic, and configurable hardware behavior.
 
-The principal components of the main pipeline are:
+The principal perception and prediction components are:
 
 1. **RF-DETR** — vehicle detection.
 2. **ByteTrack** — multi-frame vehicle tracking.
 3. **CurveLaneS / CondLaneNet** — lane detection.
 4. **Metric3D** — experimental monocular depth estimation.
 5. **Kalman-based trajectory predictor** — experimental short-term motion forecasting.
+6. **HiVT-64 / HiVT-128** — advanced trajectory-prediction experiments using historical observations and multiple future prediction modes.
 
-The MonoPilot depth experiments and HiVT evaluation are separate workstreams and should be described according to their actual integration status.
+The HiVT workstream investigates converting camera-based ByteTrack histories into the structured inputs required by a pretrained trajectory-prediction model. Its synthetic execution and structural tests must be distinguished from verified real-road inference and prediction accuracy.
+
+MonoPilot remains the separate monocular depth and distance-estimation workstream.
+
+The hardware and software configuration design contains **86 total settings**, comprising 9 ESP32 GPIO assignments and 77 software settings. It organizes feature controls, sensor parameters, operating modes, LED and buzzer behavior, LDR settings, timing, advanced controls, ultrasonic scheduling, and mode multipliers.
 
 The latest documented four-image distance experiment produced an MAE of approximately **2.38 m**. Recorded CPU tests have also shown substantial inference latency. These results provide a baseline for continued experimentation; they do not establish general distance accuracy, reliable trajectory prediction, or real-time safety performance.
 
-The next priorities are broader distance validation, camera calibration, tracking stability, trajectory-prediction evaluation, and systematic measurement of end-to-end latency.
+The next priorities are broader distance validation, camera calibration, tracking stability, HiVT input compatibility, real-video trajectory-prediction evaluation, 86-setting hardware and software validation, and systematic measurement of end-to-end latency.
 
+**VISENTRA's long-term objective is to investigate a configurable, camera-based vehicle-awareness platform that combines computer vision, temporal tracking, depth analysis, trajectory forecasting, and structured hardware control.**
